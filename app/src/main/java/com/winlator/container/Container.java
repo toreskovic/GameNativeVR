@@ -88,6 +88,7 @@ public class Container {
     private String displayRenderer = Container.DEFAULT_DISPLAY_RENDERER;
     private int xrRefreshRate = 72;
     private int xrRenderScale = 100;
+    private int xrFoveation = 1; // Off, Conservative (default), Aggressive
     // Stable saved IDs: 0 = bilinear, 1 = retired FSR, 2 = SGSR, 3 = SGSR edge direction.
     private int xrUpscaler = 2; // SGSR 1
     private int xrSgsrSharpness = 70; // hundredths: 50 = 0.5 blend, 100 = 1.0, 200 = 2.0
@@ -290,6 +291,10 @@ public class Container {
     public int getXrRefreshRate() { return xrRefreshRate; }
 
     public void setXrRefreshRate(int v) { this.xrRefreshRate = v; }
+
+    public int getXrFoveation() { return xrFoveation; }
+
+    public void setXrFoveation(int value) { xrFoveation = value >= 0 && value <= 2 ? value : 0; }
 
     public int getXrSgsrSharpness() { return xrSgsrSharpness; }
 
@@ -758,6 +763,7 @@ public class Container {
             data.put("displayRendererMode", displayRenderer);
             data.put("xrRefreshRate", xrRefreshRate);
             data.put("xrRenderScale", xrRenderScale);
+            data.put("xrFoveation", xrFoveation);
             data.put("xrUpscaler", xrUpscaler);
             data.put("xrSgsrSharpness", xrSgsrSharpness);
             data.put("sfCompatMode", sfCompatMode);
@@ -891,6 +897,9 @@ public class Container {
                     break;
                 case "xrRefreshRate" :
                     setXrRefreshRate(data.getInt(key));
+                    break;
+                case "xrFoveation" :
+                    setXrFoveation(data.getInt(key));
                     break;
                 case "xrSgsrSharpness" :
                     setXrSgsrSharpness(data.getInt(key));

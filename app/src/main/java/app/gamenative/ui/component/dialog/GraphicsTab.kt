@@ -199,6 +199,16 @@ fun GraphicsTabContent(state: ContainerConfigState, default: Boolean = false) {
                 if (config.windowsVrEnabled) {
                     SettingsListDropdown(
                         colors = settingsTileColors(),
+                        title = { Text(stringResource(R.string.xr_ffr_title)) },
+                        value = config.xrFoveation.coerceIn(0, 2),
+                        items = listOf(stringResource(R.string.xr_upscaler_off),
+                            stringResource(R.string.xr_ffr_conservative), stringResource(R.string.xr_ffr_aggressive)),
+                        onItemSelected = { mode -> state.config.value = config.copy(xrFoveation = mode) },
+                    )
+                    Text(stringResource(R.string.xr_ffr_desc),
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+                    SettingsListDropdown(
+                        colors = settingsTileColors(),
                         title = { Text(text = stringResource(R.string.xr_upscaler)) },
                         value = when (config.xrUpscaler) { 2 -> 1; 3 -> 2; else -> 0 },
                         items = listOf(stringResource(R.string.xr_upscaler_off), "SGSR 1", stringResource(R.string.xr_upscaler_sgsr_edge)),

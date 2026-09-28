@@ -2391,6 +2391,27 @@ static int submit_views_transport(
             return 0;
     }
 
+    /* The optional layer needs actual projection-image identities. It is loaded
+     * by the guest Vulkan loader, not by the Android OpenXR presenter. NOLOAD
+     * avoids accidentally creating a second, uninitialized layer instance. */
+    const char *ffr_path = getenv("GN_VR_FFR_LIBRARY");
+    if (ffr_path && *ffr_path) {
+        void *ffr = dlopen(ffr_path, RTLD_NOW | RTLD_NOLOAD);
+        if (ffr) {
+            typedef void (*register_eye_fn)(VkDevice, VkImage, uint32_t,
+                                            uint32_t, uint32_t, uint32_t, uint32_t);
+            register_eye_fn register_eye = (register_eye_fn)dlsym(ffr, "gnFfrRegisterEye");
+            if (register_eye) for (uint32_t i = 0; i < view_count; ++i) {
+                const struct gn_unix_submit_view_args *view = &views[i];
+                if (view->rect_x >= 0 && view->rect_y >= 0)
+                    register_eye(device, swapchains[view->slot].images[view->image_index].image,
+                                 view->eye, (uint32_t)view->rect_x, (uint32_t)view->rect_y,
+                                 view->rect_width, view->rect_height);
+            }
+            dlclose(ffr);
+        }
+    }
+
     pthread_mutex_lock(&socket_mutex);
     VkCommandBuffer commands[2];
     struct gn_transport_image *recorded[2];

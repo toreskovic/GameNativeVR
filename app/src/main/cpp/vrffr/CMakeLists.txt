@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.22)
+project(gamenative_vrffr CXX)
+add_library(VkLayer_GN_vr_foveation SHARED layer.cpp)
+target_compile_features(VkLayer_GN_vr_foveation PRIVATE cxx_std_17)
+target_compile_options(VkLayer_GN_vr_foveation PRIVATE -Wall -Wextra -Werror -Wno-missing-field-initializers -fvisibility=hidden)
+target_link_options(VkLayer_GN_vr_foveation PRIVATE -Wl,-Bsymbolic)
+target_link_libraries(VkLayer_GN_vr_foveation PRIVATE log)
+# Package the PIE executable under a lib*.so name so Android extracts it into
+# nativeLibraryDir, where execution is permitted even for targetSdk >= 29.
+add_executable(gn_vrffr_probe probe.cpp)
+set_target_properties(gn_vrffr_probe PROPERTIES OUTPUT_NAME libgn_vrffr_probe.so)
+target_compile_features(gn_vrffr_probe PRIVATE cxx_std_17)
+target_compile_options(gn_vrffr_probe PRIVATE -Wall -Wextra -Werror -Wno-missing-field-initializers)
+target_link_options(gn_vrffr_probe PRIVATE -Wl,-z,max-page-size=16384)
+target_link_libraries(gn_vrffr_probe PRIVATE dl)

@@ -2631,4 +2631,8 @@
     <string name="xr_upscaler_desc">Upscale immersive VR using the VR resolution scale above. Set it below 100% to use SGSR. Restart the game to apply.</string>
     <string name="xr_sgsr_sharpness">SGSR sharpness: %1$.1f</string>
     <string name="xr_sgsr_sharpness_desc">Below 1.0, blend SGSR with bilinear (0.5 = 50% SGSR). From 1.0 to 2.0, increase sharpening. Default: 0.7. Restart the game to apply.</string>
+    <string name="xr_ffr_title">VR Fixed Foveated Rendering (experimental)</string>
+    <string name="xr_ffr_conservative">Conservative</string>
+    <string name="xr_ffr_aggressive">Aggressive</string>
+    <string name="xr_ffr_desc">Reduces peripheral detail in detected VR scene passes. Conservative requires an eye-image connection; Aggressive also guesses matching scene targets. Requires a compatible Vulkan driver and restarting the game. May cause visual artifacts.</string>
 </resources>

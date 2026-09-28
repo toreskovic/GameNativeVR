@@ -80,6 +80,13 @@ class WindowsVrRuntimeService(context: Context) : Closeable {
         env.put("GAMENATIVE_XR_TRANSPORT", active.transportEndpoint)
         env.put("GAMENATIVE_XR_RUNTIME_DIR", active.runtimeDirectory)
         env.put("GAMENATIVE_XR_UNIX_LOG", payload.prefixDirectory.resolve("unix.log").path)
+        runCatching { WindowsVrFoveation.configure(applicationContext, container, payload.prefixDirectory, env) }
+            .onSuccess { diagnostics.record("foveation", it) }
+            .onFailure {
+                env.put("GN_VR_FFR", "0")
+                diagnostics.record("foveation", "Disabled: ${it.message}")
+                Timber.w(it, "VR foveation setup failed")
+            }
         val overrides = env.get("WINEDLLOVERRIDES").split(';')
             .map(String::trim)
             .filter(String::isNotEmpty)
@@ -157,6 +164,7 @@ class WindowsVrRuntimeService(context: Context) : Closeable {
             val runtime = File(active.rootDir, ".wine/drive_c/gamenative-xr")
             diagnostics.recordFileTail("Windows OpenXR runtime log", runtime.resolve("runtime.log"))
             diagnostics.recordFileTail("Wine OpenXR Unix bridge log", runtime.resolve("unix.log"))
+            diagnostics.recordFileTail("FFR direct driver probe", runtime.resolve("ffr-driver-probe.log"))
             diagnostics.recordFileTail(
                 "ColdClientLoader configuration",
                 File(active.rootDir, ".wine/drive_c/Program Files (x86)/Steam/ColdClientLoader.ini"),

@@ -21,6 +21,7 @@ data class ContainerData(
     val displayRenderer: String = Container.DEFAULT_DISPLAY_RENDERER,
     val xrRefreshRate: Int = 72,
     val xrRenderScale: Int = 100,
+    val xrFoveation: Int = 1,
     val xrUpscaler: Int = 2,
     val xrSgsrSharpness: Int = 70,
     val sfCompatMode: Boolean = true,
@@ -131,6 +132,7 @@ data class ContainerData(
                     "displayRenderer" to state.displayRenderer,
                     "xrRefreshRate" to state.xrRefreshRate,
                     "xrRenderScale" to state.xrRenderScale,
+                    "xrFoveation" to state.xrFoveation,
                     "xrUpscaler" to state.xrUpscaler,
                     "xrSgsrSharpness" to state.xrSgsrSharpness,
                     "sfCompatMode" to state.sfCompatMode,
@@ -209,6 +211,7 @@ data class ContainerData(
                     displayRenderer = (savedMap["displayRenderer"] as? String) ?: "vulkan",
                     xrRefreshRate = (savedMap["xrRefreshRate"] as? Int) ?: 72,
                     xrRenderScale = (savedMap["xrRenderScale"] as? Int) ?: 100,
+                    xrFoveation = (savedMap["xrFoveation"] as? Int)?.takeIf { it in 0..2 } ?: 1,
                     xrUpscaler = if (savedMap.containsKey("xrUpscaler")) {
                         (savedMap["xrUpscaler"] as? Int)?.takeIf { it == 2 || it == 3 } ?: 0
                     } else if (savedMap.containsKey("xrFsrEnabled")) 0 else 2,
