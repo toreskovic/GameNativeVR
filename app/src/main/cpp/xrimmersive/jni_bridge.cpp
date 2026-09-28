@@ -45,14 +45,15 @@ extern "C" {
 
 JNIEXPORT jlong JNICALL
 Java_app_gamenative_ui_screen_xr_XrNative_nativeCreate(JNIEnv *env, jclass, jobject activity,
-                                                       jint quadWidth, jint quadHeight, jfloat refreshRate) {
+                                                       jint quadWidth, jint quadHeight, jfloat refreshRate, jint upscaler,
+                                                       jint eyeWidth, jint eyeHeight, jfloat sgsrSharpness) {
     JavaVM *vm = nullptr;
     env->GetJavaVM(&vm);
 
     auto *handle = new NativeHandle();
     handle->activityGlobalRef = env->NewGlobalRef(activity);
     handle->session = new xrimmersive::XrImmersiveSession();
-    handle->session->configure(quadWidth, quadHeight, refreshRate);
+    handle->session->configure(quadWidth, quadHeight, refreshRate, upscaler, eyeWidth, eyeHeight, sgsrSharpness);
     handle->session->initialize(vm, handle->activityGlobalRef);
     {
         std::lock_guard<std::mutex> lock(gHandleMutex);
@@ -166,8 +167,8 @@ Java_app_gamenative_ui_screen_xr_XrNative_nativeWaitWindowsFrame(
         static_cast<jlong>(snapshot.predictedDisplayPeriod),
         static_cast<jlong>(snapshot.sessionState),
         static_cast<jlong>(snapshot.shouldRender ? 1 : 0),
-        static_cast<jlong>(snapshot.recommendedWidth),
-        static_cast<jlong>(snapshot.recommendedHeight),
+        static_cast<jlong>(snapshot.renderWidth),
+        static_cast<jlong>(snapshot.renderHeight),
         static_cast<jlong>(snapshot.stageAvailable ? 1 : 0),
         static_cast<jlong>(snapshot.stageBounds.width * 1000000.0f),
         static_cast<jlong>(snapshot.stageBounds.height * 1000000.0f),

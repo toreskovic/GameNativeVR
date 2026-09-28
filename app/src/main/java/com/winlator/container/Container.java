@@ -88,6 +88,9 @@ public class Container {
     private String displayRenderer = Container.DEFAULT_DISPLAY_RENDERER;
     private int xrRefreshRate = 72;
     private int xrRenderScale = 100;
+    // Stable saved IDs: 0 = bilinear, 1 = retired FSR, 2 = SGSR, 3 = SGSR edge direction.
+    private int xrUpscaler = 2; // SGSR 1
+    private int xrSgsrSharpness = 70; // hundredths: 50 = 0.5 blend, 100 = 1.0, 200 = 2.0
     private boolean sfCompatMode = true;
     private String wincomponents = DEFAULT_WINCOMPONENTS;
     private String audioDriver = DEFAULT_AUDIO_DRIVER;
@@ -287,6 +290,14 @@ public class Container {
     public int getXrRefreshRate() { return xrRefreshRate; }
 
     public void setXrRefreshRate(int v) { this.xrRefreshRate = v; }
+
+    public int getXrSgsrSharpness() { return xrSgsrSharpness; }
+
+    public void setXrSgsrSharpness(int value) { xrSgsrSharpness = Math.max(50, Math.min(200, value)); }
+
+    public int getXrUpscaler() { return xrUpscaler; }
+
+    public void setXrUpscaler(int value) { xrUpscaler = value == 2 || value == 3 ? value : 0; }
 
     public int getXrRenderScale() { return xrRenderScale; }
 
@@ -747,6 +758,8 @@ public class Container {
             data.put("displayRendererMode", displayRenderer);
             data.put("xrRefreshRate", xrRefreshRate);
             data.put("xrRenderScale", xrRenderScale);
+            data.put("xrUpscaler", xrUpscaler);
+            data.put("xrSgsrSharpness", xrSgsrSharpness);
             data.put("sfCompatMode", sfCompatMode);
             data.put("dxwrapper", dxwrapper);
             if (!dxwrapperConfig.isEmpty()) data.put("dxwrapperConfig", dxwrapperConfig);
@@ -878,6 +891,16 @@ public class Container {
                     break;
                 case "xrRefreshRate" :
                     setXrRefreshRate(data.getInt(key));
+                    break;
+                case "xrSgsrSharpness" :
+                    setXrSgsrSharpness(data.getInt(key));
+                    break;
+                case "xrUpscaler" :
+                    setXrUpscaler(data.getInt(key));
+                    break;
+                case "xrFsrEnabled" :
+                    // Retired FSR toggle falls back to bilinear, regardless of the new default.
+                    if (!data.has("xrUpscaler")) setXrUpscaler(0);
                     break;
                 case "xrRenderScale" :
                     setXrRenderScale(data.getInt(key));

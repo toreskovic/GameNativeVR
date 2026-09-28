@@ -513,6 +513,26 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
         super.onDestroy()
     }
 
+    private fun physicalEyeResolution(): Pair<Int, Int> {
+        // Query the built-in display, not this activity's virtual flat-window
+        // display or density-scaled window metrics. Display.Mode reports pixels.
+        return runCatching {
+            val manager = getSystemService(android.hardware.display.DisplayManager::class.java)
+            val mode = manager?.getDisplay(android.view.Display.DEFAULT_DISPLAY)?.mode
+                ?: return@runCatching Pair(0, 0)
+            val width = maxOf(mode.physicalWidth, mode.physicalHeight)
+            val height = minOf(mode.physicalWidth, mode.physicalHeight)
+            // The headset exposes its two panels as a side-by-side display.
+            // Reject single-eye/unknown layouts and let OpenXR provide a fallback.
+            if (width % 2 != 0 || height <= 0 || width.toLong() * 2 < height.toLong() * 3)
+                return@runCatching Pair(0, 0)
+            Pair(width / 2, height)
+        }.getOrElse {
+            Timber.w(it, "Physical headset resolution unavailable; using OpenXR recommendation")
+            Pair(0, 0)
+        }
+    }
+
     private fun startXrSessionIfNeeded() {
         if (xrSessionHandle != 0L) return
         // Mirror GameNativeXR's model: the XR surface follows the container's screen size
@@ -520,6 +540,8 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
         var quadW = 1280
         var quadH = 720
         var refreshRate = 72f
+        var upscaler = 0
+        var sgsrSharpness = 0.7f
         currentAppId?.let { appId ->
             runCatching { app.gamenative.utils.ContainerUtils.getContainer(this, appId) }.getOrNull()?.let { container ->
                 val parts = container.screenSize.split("x")
@@ -530,14 +552,17 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
                     quadH = h
                 }
                 refreshRate = container.xrRefreshRate.toFloat()
+                sgsrSharpness = container.xrSgsrSharpness / 100f
+                upscaler = if (container.xrRenderScale < 100) container.xrUpscaler else 0
             }
         }
         if (quadW < 1280) {
             quadH = 1280 * quadH / quadW
             quadW = 1280
         }
+        val (eyeWidth, eyeHeight) = physicalEyeResolution()
         xrSessionHandle = try {
-            XrNative.nativeCreate(this, quadW, quadH, refreshRate)
+            XrNative.nativeCreate(this, quadW, quadH, refreshRate, upscaler, eyeWidth, eyeHeight, sgsrSharpness)
         } catch (t: Throwable) {
             Timber.w(t, "Native OpenXR module unavailable — immersive rendering/controller mapping disabled")
             return

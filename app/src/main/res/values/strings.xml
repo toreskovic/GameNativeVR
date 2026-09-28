@@ -2624,4 +2624,11 @@
     <string name="gyro_degrees_per_second_value">%1$.1f°/s</string>
     <string name="gyro_milliseconds_value">%1$d ms</string>
     <string name="reset_gyro_settings">Reset gyro settings</string>
+    <string name="xr_render_scale_physical_desc">100% fits the OpenXR recommended aspect ratio inside the physical display resolution per eye, within runtime limits. OpenXR recommended resolution is used if the display size is unavailable. Restart the game to apply.</string>
+    <string name="xr_upscaler">VR upscaling</string>
+    <string name="xr_upscaler_sgsr_edge">SGSR 1 (edge direction)</string>
+    <string name="xr_upscaler_off">Off (bilinear)</string>
+    <string name="xr_upscaler_desc">Upscale immersive VR using the VR resolution scale above. Set it below 100% to use SGSR. Restart the game to apply.</string>
+    <string name="xr_sgsr_sharpness">SGSR sharpness: %1$.1f</string>
+    <string name="xr_sgsr_sharpness_desc">Below 1.0, blend SGSR with bilinear (0.5 = 50% SGSR). From 1.0 to 2.0, increase sharpening. Default: 0.7. Restart the game to apply.</string>
 </resources>

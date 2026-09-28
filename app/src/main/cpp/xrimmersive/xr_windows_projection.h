@@ -1,6 +1,7 @@
 #pragma once
 
 #include "xr_windows_transport.h"
+#include "xr_sgsr.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -17,7 +18,7 @@ namespace xrimmersive::windowsvr {
 
 class WindowsProjectionPresenter {
 public:
-    bool initialize(XrSession session, int64_t format, uint32_t width, uint32_t height, EGLDisplay display);
+    bool initialize(XrSession session, int64_t format, uint32_t width, uint32_t height, EGLDisplay display, int upscaler, float sgsrSharpness);
     bool render(WindowsFrameTransport &transport, XrSpace space, XrCompositionLayerProjection *layer);
     void shutdown();
 
@@ -52,6 +53,7 @@ private:
     std::array<std::array<int, WindowsFrameTransport::kMaxImages>, 2> cpuTextureHeights_{};
     std::array<uint64_t, 2> renderedSerials_{0, 0};
     EGLSyncKHR acquireSync_ = EGL_NO_SYNC_KHR;
+    SgsrUpscaler sgsr_;
     GLuint framebuffer_ = 0;
     GLuint program_ = 0;
     GLuint vertexBuffer_ = 0;

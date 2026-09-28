@@ -51,7 +51,7 @@ GLuint compileShader(GLenum type, const char *source) {
 }
 
 bool WindowsProjectionPresenter::initialize(XrSession session, int64_t format, uint32_t width,
-                                            uint32_t height, EGLDisplay display) {
+                                            uint32_t height, EGLDisplay display, int upscaler, float sgsrSharpness) {
     session_ = session;
     width_ = width;
     height_ = height;
@@ -74,7 +74,9 @@ bool WindowsProjectionPresenter::initialize(XrSession session, int64_t format, u
             swapchain_, count, &count,
             reinterpret_cast<XrSwapchainImageBaseHeader *>(images_.data())))) return false;
     glGenFramebuffers(1, &framebuffer_);
-    return ensureProgram();
+    if (!ensureProgram()) return false;
+    if (upscaler == 2 || upscaler == 3) sgsr_.initialize(upscaler == 3, sgsrSharpness);
+    return true;
 }
 
 bool WindowsProjectionPresenter::ensureProgram() {
@@ -375,6 +377,13 @@ void WindowsProjectionPresenter::drawEye(uint32_t eye, const EyeFrame &source,
     const float v0 = (source.flipY ? source.sourceY + sourceHeight : source.sourceY) /
                      static_cast<float>(source.height);
     const float vScale = (source.flipY ? -sourceHeight : sourceHeight) / source.height;
+    if (sgsr_.ready() && sourceWidth <= width_ && sourceHeight <= height_ &&
+        (sourceWidth < width_ || sourceHeight < height_)) {
+        sgsr_.draw(source.width, source.height, source.sourceX, source.sourceY,
+                   sourceWidth, sourceHeight, source.flipY);
+        return;
+    }
+    glUseProgram(program_);
     glUniform4f(uvTransformLocation_, source.sourceX / static_cast<float>(source.width), v0,
                 sourceWidth / source.width, vScale);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -476,6 +485,7 @@ bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpac
 }
 
 void WindowsProjectionPresenter::shutdown() {
+    sgsr_.shutdown();
     if (acquireSync_ != EGL_NO_SYNC_KHR) {
         eglDestroySyncKHR(display_, acquireSync_);
         acquireSync_ = EGL_NO_SYNC_KHR;

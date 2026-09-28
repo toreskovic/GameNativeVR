@@ -194,8 +194,39 @@ fun GraphicsTabContent(state: ContainerConfigState, default: Boolean = false) {
                         valueRange = 25f..100f,
                     )
                     Text(text = "${config.xrRenderScale}%")
+                    Text(text = stringResource(R.string.xr_render_scale_physical_desc))
                 }
                 if (config.windowsVrEnabled) {
+                    SettingsListDropdown(
+                        colors = settingsTileColors(),
+                        title = { Text(text = stringResource(R.string.xr_upscaler)) },
+                        value = when (config.xrUpscaler) { 2 -> 1; 3 -> 2; else -> 0 },
+                        items = listOf(stringResource(R.string.xr_upscaler_off), "SGSR 1", stringResource(R.string.xr_upscaler_sgsr_edge)),
+                        onItemSelected = { mode ->
+                            state.config.value = config.copy(xrUpscaler = when (mode) { 1 -> 2; 2 -> 3; else -> 0 })
+                        },
+                    )
+                    if (config.xrUpscaler == 2 || config.xrUpscaler == 3) {
+                        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                            Text(stringResource(R.string.xr_sgsr_sharpness,
+                                config.xrSgsrSharpness.coerceIn(50, 200) / 100f))
+                            Slider(
+                                value = config.xrSgsrSharpness.coerceIn(50, 200) / 100f,
+                                onValueChange = { value ->
+                                    state.config.value = config.copy(
+                                        xrSgsrSharpness = (value * 10).roundToInt().coerceIn(5, 20) * 10,
+                                    )
+                                },
+                                valueRange = 0.5f..2f,
+                                steps = 14,
+                            )
+                            Text(stringResource(R.string.xr_sgsr_sharpness_desc))
+                        }
+                    }
+                    Text(
+                        text = stringResource(R.string.xr_upscaler_desc),
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    )
                     SettingsSwitch(
                         colors = settingsTileColorsAlt(),
                         title = { Text(text = stringResource(R.string.xr_open_composite_toggle)) },

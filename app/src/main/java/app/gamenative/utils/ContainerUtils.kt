@@ -310,6 +310,8 @@ object ContainerUtils {
             displayRenderer = container.displayRenderer,
             xrRefreshRate = container.xrRefreshRate,
             xrRenderScale = container.xrRenderScale,
+            xrUpscaler = container.xrUpscaler,
+            xrSgsrSharpness = container.xrSgsrSharpness,
             sfCompatMode = container.sfCompatMode,
             dxwrapper = container.dxWrapper,
             dxwrapperConfig = container.dxWrapperConfig,
@@ -501,6 +503,8 @@ object ContainerUtils {
         container.displayRenderer = containerData.displayRenderer
         container.xrRefreshRate = containerData.xrRefreshRate
         container.xrRenderScale = containerData.xrRenderScale
+        container.xrUpscaler = containerData.xrUpscaler
+        container.xrSgsrSharpness = containerData.xrSgsrSharpness
         container.sfCompatMode = containerData.sfCompatMode
         container.dxWrapper = containerData.dxwrapper
         container.dxWrapperConfig = containerData.dxwrapperConfig

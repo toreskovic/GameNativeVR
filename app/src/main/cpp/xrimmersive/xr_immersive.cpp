@@ -2,6 +2,7 @@
 
 #include <android/log.h>
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -135,12 +136,17 @@ void XrImmersiveSession::submitFrame(const uint8_t *rgbaPixels, int32_t width, i
     hasPendingFrame_ = true;
 }
 
-void XrImmersiveSession::configure(int32_t quadWidth, int32_t quadHeight, float refreshRate) {
+void XrImmersiveSession::configure(int32_t quadWidth, int32_t quadHeight, float refreshRate, int upscaler,
+                                     int32_t eyeWidth, int32_t eyeHeight, float sgsrSharpness) {
     if (quadWidth > 0 && quadHeight > 0) {
         swapchainWidth_ = quadWidth;
         swapchainHeight_ = quadHeight;
     }
     if (refreshRate > 0.0f) requestedRefreshRate_ = refreshRate;
+    upscaler_ = upscaler;
+    sgsrSharpness_ = sgsrSharpness;
+    physicalEyeWidth_ = eyeWidth;
+    physicalEyeHeight_ = eyeHeight;
 }
 
 void XrImmersiveSession::setSharedGameBuffer(AHardwareBuffer *buffer) {
@@ -418,7 +424,15 @@ bool XrImmersiveSession::setupInstanceAndSession() {
     }
 
     const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
-    eglContext_ = eglCreateContext(eglDisplay_, eglConfig_, EGL_NO_CONTEXT, contextAttribs);
+    // SGSR uses core texture gathers. Request GLES 3.1, retaining the usual
+    // context fallback so unsupported devices can still use bilinear rendering.
+    if (upscaler_ == 2 || upscaler_ == 3) {
+        const EGLint sgsrAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3,
+                                     EGL_CONTEXT_MINOR_VERSION_KHR, 1, EGL_NONE};
+        eglContext_ = eglCreateContext(eglDisplay_, eglConfig_, EGL_NO_CONTEXT, sgsrAttribs);
+    }
+    if (eglContext_ == EGL_NO_CONTEXT)
+        eglContext_ = eglCreateContext(eglDisplay_, eglConfig_, EGL_NO_CONTEXT, contextAttribs);
 
     const EGLint pbufferAttribs[] = {EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE};
     eglPbufferSurface_ = eglCreatePbufferSurface(eglDisplay_, eglConfig_, pbufferAttribs);
@@ -588,10 +602,35 @@ bool XrImmersiveSession::setupInstanceAndSession() {
     if (projectionViewCount >= 2 && XR_SUCCEEDED(xrEnumerateViewConfigurationViews(
             instance_, systemId_, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
             projectionViewCount, &projectionViewCount, projectionViews.data()))) {
+        // Fit the recommended eye aspect ratio inside the physical panel bounds.
+        // The slider and upscaler share this fitted output as their 100% baseline.
+        const bool physical = physicalEyeWidth_ > 0 && physicalEyeHeight_ > 0;
+        const uint32_t recommendedWidth = projectionViews[0].recommendedImageRectWidth;
+        const uint32_t recommendedHeight = projectionViews[0].recommendedImageRectHeight;
+        GLint maxTextureSize = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+        const uint32_t maxWidth = std::min({projectionViews[0].maxImageRectWidth,
+            projectionViews[1].maxImageRectWidth, static_cast<uint32_t>(maxTextureSize),
+            physical ? static_cast<uint32_t>(physicalEyeWidth_) : recommendedWidth}) & ~1u;
+        const uint32_t maxHeight = std::min({projectionViews[0].maxImageRectHeight,
+            projectionViews[1].maxImageRectHeight, static_cast<uint32_t>(maxTextureSize),
+            physical ? static_cast<uint32_t>(physicalEyeHeight_) : recommendedHeight}) & ~1u;
+        const double fit = std::min(static_cast<double>(maxWidth) / recommendedWidth,
+                                    static_cast<double>(maxHeight) / recommendedHeight);
+        // Nearest even pixel dimensions, never exceeding physical/runtime limits.
+        const uint32_t eyeWidth = std::min(maxWidth,
+            static_cast<uint32_t>(std::round(recommendedWidth * fit / 2.0)) * 2u);
+        const uint32_t eyeHeight = std::min(maxHeight,
+            static_cast<uint32_t>(std::round(recommendedHeight * fit / 2.0)) * 2u);
+        LOGI("Windows VR resolution: physical=%dx%d recommended=%ux%u output=%ux%u baseline=%s",
+             physicalEyeWidth_, physicalEyeHeight_,
+             projectionViews[0].recommendedImageRectWidth,
+             projectionViews[0].recommendedImageRectHeight, eyeWidth, eyeHeight,
+             physical ? "physical display, recommended aspect (runtime limits applied)" : "OpenXR fallback");
         {
             std::lock_guard<std::mutex> lock(windowsSnapshotMutex_);
-            windowsSnapshot_.recommendedWidth = projectionViews[0].recommendedImageRectWidth;
-            windowsSnapshot_.recommendedHeight = projectionViews[0].recommendedImageRectHeight;
+            windowsSnapshot_.renderWidth = eyeWidth;
+            windowsSnapshot_.renderHeight = eyeHeight;
             const XrResult boundsResult = xrGetReferenceSpaceBoundsRect(
                 session_, XR_REFERENCE_SPACE_TYPE_STAGE, &windowsSnapshot_.stageBounds);
             windowsSnapshot_.stageSpaceActive = stageSpace_ != XR_NULL_HANDLE;
@@ -609,9 +648,7 @@ bool XrImmersiveSession::setupInstanceAndSession() {
         }
         windowsProjectionReady_ = windowsProjection_.initialize(
             session_, chosenFormat,
-            projectionViews[0].recommendedImageRectWidth,
-            projectionViews[0].recommendedImageRectHeight,
-            eglDisplay_);
+            eyeWidth, eyeHeight, eglDisplay_, upscaler_, sgsrSharpness_);
     }
         windowsTransport_.start("@gamenative-xr");
 

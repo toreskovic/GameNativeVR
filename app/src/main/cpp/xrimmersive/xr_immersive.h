@@ -89,8 +89,8 @@ struct WindowsRuntimeSnapshot {
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     bool shouldRender = false;
     XrViewStateFlags viewStateFlags = 0;
-    uint32_t recommendedWidth = 0;
-    uint32_t recommendedHeight = 0;
+    uint32_t renderWidth = 0;
+    uint32_t renderHeight = 0;
     bool stageAvailable = false;
     bool stageSpaceActive = false;
     uint32_t recenterSerial = 0;
@@ -102,7 +102,8 @@ struct WindowsRuntimeSnapshot {
 // Owns the OpenXR instance/session and its dedicated frame-loop thread.
 class XrImmersiveSession {
 public:
-    void configure(int32_t quadWidth, int32_t quadHeight, float refreshRate);
+    void configure(int32_t quadWidth, int32_t quadHeight, float refreshRate, int upscaler,
+                                     int32_t eyeWidth, int32_t eyeHeight, float sgsrSharpness);
     bool initialize(JavaVM *vm, jobject activityRef);
     void requestStop();
     void join();
@@ -193,6 +194,10 @@ private:
     int32_t swapchainWidth_ = 1280;
     int32_t swapchainHeight_ = 720;
     float requestedRefreshRate_ = 72.0f;
+    int upscaler_ = 0;
+    float sgsrSharpness_ = 0.7f;
+    int32_t physicalEyeWidth_ = 0;
+    int32_t physicalEyeHeight_ = 0;
 
     EGLDisplay eglDisplay_ = EGL_NO_DISPLAY;
     EGLContext eglContext_ = EGL_NO_CONTEXT;

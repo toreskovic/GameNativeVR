@@ -18,6 +18,7 @@ add_library(xrimmersive SHARED
     xr_immersive.cpp
     jni_bridge.cpp
     xr_windows_projection.cpp
+    xr_sgsr.cpp
     xr_windows_transport.cpp
 )
 
