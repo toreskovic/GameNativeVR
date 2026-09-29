@@ -965,6 +965,14 @@ object ContainerUtils {
             }
         }
 
+        // Apply after imported/community/default settings so new Beat Saber containers
+        // cannot inherit the flat-screen argument that stalls VR startup.
+        if (appId == "STEAM_620980") {
+            containerData = containerData.copy(
+                execArgs = app.gamenative.gamefixes.beatSaberVrLaunchArgs(containerData.execArgs),
+            )
+        }
+
         // If custom config is provided, just apply it and return
         if (customConfig?.dxwrapper != null) {
             applyToContainer(context, container, containerData)
