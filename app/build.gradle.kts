@@ -68,7 +68,16 @@ android {
     }
 
     defaultConfig {
-        applicationId = "app.gamenative"
+        applicationId = "app.gamenative.vr"
+
+        // Override both properties after registering a separate Nexus OAuth client.
+        val nexusClientId = providers.gradleProperty("nexusOAuthClientId").getOrElse("gamenative")
+        val nexusScheme = providers.gradleProperty("nexusOAuthScheme").getOrElse("app.gamenative")
+        require(nexusClientId.matches(Regex("[A-Za-z0-9._-]+")))
+        require(nexusScheme.matches(Regex("[a-z][a-z0-9+.-]*")))
+        buildConfigField("String", "NEXUS_OAUTH_CLIENT_ID", "\"$nexusClientId\"")
+        buildConfigField("String", "NEXUS_OAUTH_REDIRECT_URI", "\"$nexusScheme://oauth/callback\"")
+        manifestPlaceholders["nexusOAuthScheme"] = nexusScheme
 
         minSdk = 26
 

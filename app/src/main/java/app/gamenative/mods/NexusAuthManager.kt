@@ -609,7 +609,7 @@ private fun parseAndValidateCallback(callbackUri: String): NexusAuthorizationCal
         throw NexusOAuthException("Nexus returned an invalid callback", cause = error)
     }
     if (
-        !uri.scheme.equals("app.gamenative", ignoreCase = true) ||
+        !uri.scheme.equals(URI(NexusOAuthConfig.REDIRECT_URI).scheme, ignoreCase = true) ||
         !uri.host.equals("oauth", ignoreCase = true) ||
         uri.rawPath != "/callback" ||
         uri.userInfo != null ||

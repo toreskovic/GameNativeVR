@@ -209,10 +209,10 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
             String memPath;
             if (i == 0) {
                 // Player 1 uses the original, non-numbered path that is known to work.
-                memPath = "/data/data/app.gamenative/files/imagefs/tmp/gamepad.mem";
+                memPath = new File(environment.getImageFs().getRootDir(), "tmp/gamepad.mem").getAbsolutePath();
             } else {
                 // Players 2, 3, 4 use a 1-based index.
-                memPath = "/data/data/app.gamenative/files/imagefs/tmp/gamepad" + i + ".mem";
+                memPath = new File(environment.getImageFs().getRootDir(), "tmp/gamepad" + i + ".mem").getAbsolutePath();
             }
 
             File memFile = new File(memPath);
@@ -379,6 +379,9 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
         if (this.envVars != null) {
             envVars.putAll(this.envVars);
         }
+
+        // Match WinHandler's shared-memory directory, including alternate application IDs.
+        envVars.put("EVSHIM_BASE_PATH", context.getFilesDir().getAbsolutePath());
 
         if (BuildConfig.XR_BUILD) {
             String shimPath = context.getApplicationInfo().nativeLibraryDir + "/libkgslshim.so";

@@ -92,7 +92,7 @@
                     android:scheme="gamenative" />
             </intent-filter>
             <intent-filter>
-                <action android:name="app.gamenative.LAUNCH_GAME" />
+                <action android:name="${applicationId}.LAUNCH_GAME" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
             <intent-filter>
@@ -129,7 +129,7 @@
                 <data
                     android:host="oauth"
                     android:path="/callback"
-                    android:scheme="app.gamenative" />
+                    android:scheme="${nexusOAuthScheme}" />
             </intent-filter>
         </activity>
 

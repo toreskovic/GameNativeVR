@@ -89,7 +89,7 @@ internal suspend fun createPinnedShortcut(context: Context, gameId: Int, label: 
     val appContext = context.applicationContext
     val shortcutManager = appContext.getSystemService(ShortcutManager::class.java)
 
-    val intent = Intent("app.gamenative.LAUNCH_GAME").apply {
+    val intent = Intent(app.gamenative.BuildConfig.APPLICATION_ID + ".LAUNCH_GAME").apply {
         setClass(appContext, MainActivity::class.java)
         putExtra("app_id", gameId)
         putExtra("game_source", gameSource.name)

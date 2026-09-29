@@ -6,8 +6,8 @@ import java.util.Base64
 
 /** Public/native Nexus OAuth configuration. A client secret must never be shipped in the app. */
 object NexusOAuthConfig {
-    const val CLIENT_ID = "gamenative"
-    const val REDIRECT_URI = "app.gamenative://oauth/callback"
+    const val CLIENT_ID = app.gamenative.BuildConfig.NEXUS_OAUTH_CLIENT_ID
+    const val REDIRECT_URI = app.gamenative.BuildConfig.NEXUS_OAUTH_REDIRECT_URI
     const val AUTHORIZATION_ENDPOINT = "https://users.nexusmods.com/oauth/authorize"
     const val TOKEN_ENDPOINT = "https://users.nexusmods.com/oauth/token"
     const val REVOCATION_ENDPOINT = "https://users.nexusmods.com/oauth/revoke"

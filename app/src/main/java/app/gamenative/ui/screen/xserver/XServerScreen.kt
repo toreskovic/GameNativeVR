@@ -4118,7 +4118,7 @@ private fun setupXEnvironment(
         val enableGstreamer = container.isGstreamerWorkaround()
 
         if (enableGstreamer) {
-            for (envVar in Container.MEDIACONV_ENV_VARS) {
+            for (envVar in Container.getMediaConvEnvVars(context)) {
                 val parts: Array<String?> = envVar.split("=".toRegex(), limit = 2).toTypedArray()
                 if (parts.size == 2) {
                     envVars.put(parts[0], parts[1])

@@ -92,7 +92,7 @@ class SteamUtilsFileSearchTest {
         container.setRootDir(containerDir)
         container.name = "Test Container"
         // Set up drives the same way the app does for Steam games
-        val defaultDrives = Container.DEFAULT_DRIVES
+        val defaultDrives = Container.getDefaultDrives()
         val appDirPath = appDir.absolutePath
         val drive: Char = Container.getNextAvailableDriveLetter(defaultDrives)
         container.drives = "$defaultDrives$drive:$appDirPath"

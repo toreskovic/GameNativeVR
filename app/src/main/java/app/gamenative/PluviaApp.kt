@@ -61,6 +61,7 @@ class PluviaApp : SplitCompatApplication() {
         super.onCreate()
         instance = this
 
+        android.system.Os.setenv("EVSHIM_BASE_PATH", filesDir.absolutePath, true)
         preloadSystemLibraries()
 
         // Allows to find resource streams not closed within GameNative and JavaSteam
@@ -215,6 +216,11 @@ class PluviaApp : SplitCompatApplication() {
         internal var onDestinationChangedListener: NavChangedListener? = null
 
         private lateinit var instance: PluviaApp
+
+        @JvmStatic
+        fun getDefaultDrives(): String =
+            "D:" + android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS) +
+                "E:" + java.io.File(instance.dataDir, "storage").absolutePath
         private var cachedDefaultScreenSize: String? = null
 
         // TODO: find a way to make this saveable, this is terrible (leak that memory baby)

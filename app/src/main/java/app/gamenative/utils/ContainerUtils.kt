@@ -857,7 +857,7 @@ object ContainerUtils {
         // Initialize container with default/custom config or best config
         var containerData = if (customConfig != null) {
             // Use custom config, but ensure drives are set if not specified
-            if (customConfig.drives == Container.DEFAULT_DRIVES) {
+            if (customConfig.drives == Container.getDefaultDrives()) {
                 customConfig.copy(drives = drives)
             } else {
                 customConfig
