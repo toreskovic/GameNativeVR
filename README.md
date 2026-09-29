@@ -1,5 +1,42 @@
 <div align="center">
 
+# GameNative VR
+
+**A fork of GameNative with experimental performance and compatibility improvements for playing PCVR games on standalone VR headsets (Quest 2 / 3, Pico 4)**
+
+</div>
+
+## Differences to GameNative
+
+- **Support for the Pico 4 headset** (via a patched Turnip driver)
+- Native display resolution querying. By comparison, vanilla GameNative queries the OpenXR runtime for a "recommended resolution" which is lower than the actual display resolution. One caveat tho, we are still applying the aspect ratio that the OpenXR runtime returns.
+- SGSR (Snapdragon Game Super Resolution). A better alternative to FSR for mobile / VR hardware. Foveated for squeezing out a bit more performance
+- Experimental fixed foveated rendering injected in any game (in practice it's more than a bit janky but works in Beat Saber)
+- Game compatibility fixes (Clone Drone in the Hyperdome anyone?)
+- A toggle to disable MSAA in DX11 games (some games don't expose a setting and MSAA is expensive)
+- FOV scale so you can literally cut corners for performance gain
+
+All new features are configurable under the graphics tab in the container settings
+
+## Anecdotal performance gains
+
+**All testing was done on a Pico 4. Resolutions are approximate since this fork is applying a bit of an aspect ratio so in practice it's not a square**
+
+**Beat Saber (all graphics settings low or off)**: vanilla GameNative needed 60% resolution scaling (1296x1296 per eye) to get stable 72 FPS. With fixed foveated rendering, it goes to 85% (1836x1836) with SGSR or 90% (1944x1944) without SGSR while still at a stable 72 FPS. Lowering the FOV gets it to 100% resolution at 72 FPS.
+
+**Clone Drone in the Hyperdome**: didn't run on vanilla GameNative. Early tests without foveation in this fork ran at about 35-40 FPS at 65% resolution scaling with SGSR (I'm assuming vanilla GameNative would perform similarly). Forcing MSAA off gets it to 65-72 at the same resolution. FFR doesn't seem to help much for some reason but reducing FOV can get it further.
+
+## Development Notice
+
+LLMs were used extensively in developing this fork. I'm treating it all as a quick 'n' dirty proof of concept to see what's possible and tailoring it to my own use cases. Expect buggy and sporadic releases and zero support.
+
+**If you wish to contribute, the best way to do so is to take concepts / features from this fork, implement them more properly, and submit them as PRs for vanilla GameNative. Credit / mention is welcome but not needed since I didn't write the bulk of the code myself.**
+
+# Original GameNative README:
+
+
+<div align="center">
+
 # GameNative
 
 **Play the PC games you already own — from Steam, Epic and GOG — on your Android device, with cloud saves.**
