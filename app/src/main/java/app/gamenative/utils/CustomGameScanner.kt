@@ -584,35 +584,6 @@ object CustomGameScanner {
     fun isPrimaryEmulatedVolume(path: String): Boolean = path.startsWith(PRIMARY_EMULATED_PREFIX)
 
     /**
-     * Moves a custom game out of the primary volume's public CustomGames root into the app
-     * sandbox. Only folders with a stored id in .gamenative are moved, since otherwise the id is
-     * derived from the folder path and the game would lose its container.
-     */
-    fun migrateFromPublicRoot(folderPath: String?): String? {
-        if (folderPath.isNullOrBlank() || !isPrimaryEmulatedVolume(folderPath)) return folderPath
-        val appDir = DownloadService.baseExternalAppDirPath
-        if (appDir.isEmpty()) return folderPath
-        val publicRoot = StorageUtils.publicInstallRoot(File(appDir)) ?: return folderPath
-        val publicCustomRoot = File(publicRoot, "CustomGames")
-        val src = File(folderPath)
-        if (src.parentFile != publicCustomRoot || !src.isDirectory) return folderPath
-        if (GameMetadataManager.getAppId(src) == null) return folderPath
-        val dst = File(defaultRootPath, src.name)
-        if (dst.exists()) {
-            Timber.tag("CustomGameScanner").w("Cannot migrate $folderPath; ${dst.absolutePath} already exists")
-            return folderPath
-        }
-        return if (src.renameTo(dst)) {
-            Timber.tag("CustomGameScanner").i("Migrated custom game $folderPath to ${dst.absolutePath}")
-            invalidateCache()
-            dst.absolutePath
-        } else {
-            Timber.tag("CustomGameScanner").w("Could not migrate $folderPath; leaving in place")
-            folderPath
-        }
-    }
-
-    /**
      * Whether [folderPath] is inside an app-managed CustomGames root and therefore ours to
      * delete when the game is removed, unlike folders mapped in place.
      */

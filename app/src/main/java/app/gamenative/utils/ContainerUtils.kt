@@ -1032,7 +1032,9 @@ object ContainerUtils {
         }
 
         val resolvedGameFolderPath = if (gameSource == GameSource.CUSTOM_GAME) {
-            CustomGameScanner.migrateFromPublicRoot(gameFolderPath)
+            // Public CustomGames folders may also be used by vanilla GameNative.
+            // Launch them in place; never move them into this app's private sandbox.
+            gameFolderPath
         } else {
             StorageUtils.resolveLegacyGameDir(gameFolderPath)
         }
