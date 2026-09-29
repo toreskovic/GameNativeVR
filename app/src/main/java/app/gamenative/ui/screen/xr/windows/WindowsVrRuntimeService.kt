@@ -68,6 +68,14 @@ class WindowsVrRuntimeService(context: Context) : Closeable {
             config = active.copy(enabled = false)
             return
         }
+        // Apply after custom environment variables so the graphics toggle also
+        // overrides an MSAA workaround previously entered by the user.
+        val dxvkOptions = env.get("DXVK_CONFIG").trim().removeSurrounding("\"")
+            .split(';', '\n', '\r')
+            .map(String::trim)
+            .filter { it.isNotEmpty() && it.substringBefore('=').trim() != "d3d11.disableMsaa" }
+        env.put("DXVK_CONFIG", (dxvkOptions +
+            "d3d11.disableMsaa=${if (container.isXrForceDisableMsaa) "True" else "False"}").joinToString(";"))
         runtimeLogDirectory = payload.prefixDirectory
         listOf("runtime.log", "unix.log").forEach { payload.prefixDirectory.resolve(it).delete() }
         env.put("XR_RUNTIME_JSON", active.runtimeManifest)

@@ -219,6 +219,15 @@ fun GraphicsTabContent(state: ContainerConfigState, default: Boolean = false) {
                     )
                     Text(stringResource(R.string.xr_fov_border_desc),
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+                    SettingsSwitch(
+                        colors = settingsTileColorsAlt(),
+                        title = { Text(stringResource(R.string.xr_force_disable_msaa)) },
+                        subtitle = { Text(stringResource(R.string.xr_force_disable_msaa_desc)) },
+                        state = config.xrForceDisableMsaa,
+                        onCheckedChange = { checked ->
+                            state.config.value = config.copy(xrForceDisableMsaa = checked)
+                        },
+                    )
                     SettingsListDropdown(
                         colors = settingsTileColors(),
                         title = { Text(stringResource(R.string.xr_ffr_title)) },

@@ -1,8 +1,14 @@
 {
   "version": 1,
-  "updatedAt": "2026-09-13",
+  "updatedAt": "2026-09-28",
   "items": {
     "driver": [
+      {
+        "id": "Turnip Adreno Driver T30 (@Mr_Purple_666)-Pico-A10-compat",
+        "name": "Turnip Adreno Driver T30 (@Mr_Purple_666)-Pico-A10-compat",
+        "url": "https://github.com/toreskovic/Turnip-Pico-4-Android-10-Patcher/releases/download/v0.0.1/turnip_mrpurple_T30-toasted.adpkg-Pico-A10-compat.zip",
+        "variant": "bionic"
+      },
       {
         "id": "Turnip Gen8 V34",
         "name": "Turnip_Gen8_V34",

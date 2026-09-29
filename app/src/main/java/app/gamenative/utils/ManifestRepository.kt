@@ -18,7 +18,7 @@ object ManifestRepository {
         if (BuildConfig.DEBUG) {
             readLocalManifest(context)?.let {
                 Timber.i("ManifestRepository: using local debug manifest")
-                return it
+                return withXrDriver(context, it)
             }
         }
 
@@ -28,7 +28,7 @@ object ManifestRepository {
         val isStale = System.currentTimeMillis() - lastFetchedAt >= ONE_DAY_MS
 
         if (cachedJson.isNotEmpty() && !isStale) {
-            return cachedManifest
+            return withXrDriver(context, cachedManifest)
         }
 
         val fetched = fetchManifestJson()
@@ -38,11 +38,26 @@ object ManifestRepository {
                 val now = System.currentTimeMillis()
                 PrefManager.componentManifestJson = fetched
                 PrefManager.componentManifestFetchedAt = now
-                return parsed
+                return withXrDriver(context, parsed)
             }
         }
 
-        return cachedManifest
+        return withXrDriver(context, cachedManifest)
+    }
+
+    private fun withXrDriver(context: Context, manifest: ManifestData): ManifestData {
+        if (!BuildConfig.XR_BUILD) return manifest
+        val bundled = try {
+            context.assets.open("xr-manifest.json").bufferedReader().use { parseManifest(it.readText()) }
+        } catch (e: Exception) {
+            Timber.w(e, "ManifestRepository: bundled XR manifest unavailable")
+            null
+        }
+        val entry = bundled?.items?.get(ManifestContentTypes.DRIVER)
+            ?.firstOrNull { it.id == ContainerUtils.WRAPPER_PICO_A10 } ?: return manifest
+        val drivers = manifest.items[ManifestContentTypes.DRIVER].orEmpty()
+        return manifest.copy(items = manifest.items +
+            (ManifestContentTypes.DRIVER to (listOf(entry) + drivers.filterNot { it.id == entry.id })))
     }
 
     private suspend fun fetchManifestJson(): String? = withContext(Dispatchers.IO) {

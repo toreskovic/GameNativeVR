@@ -15,7 +15,22 @@
         tools:remove="android:maxSdkVersion"/>
 
 
-    <!-- Optional: only used by the Meta Quest immersive launch mode, not required to install/run the app. -->
+    <!-- This flavor ships the OpenXR loader as a prebuilt .so, so its AAR manifest
+         is not merged in. Declare its permissions and runtime/layer discovery here. -->
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+
+    <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRApiLayerService" />
+        </intent>
+    </queries>
+
+    <!-- Optional: only used by immersive launch mode, not required to install/run the app. -->
     <uses-feature
         android:name="android.hardware.vr.headtracking"
         android:version="1"

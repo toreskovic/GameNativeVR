@@ -655,14 +655,14 @@ object PrefManager {
 
     private val BOX64_PRESET = stringPreferencesKey("box64_preset")
     var box64Preset: String
-        get() = getPref(BOX64_PRESET, Box86_64Preset.COMPATIBILITY)
+        get() = getPref(BOX64_PRESET, Box86_64Preset.UNITY_MONO_BLEEDING_EDGE)
         set(value) {
             setPref(BOX64_PRESET, value)
         }
 
     private val FEXCORE_PRESET = stringPreferencesKey("fexcore_preset")
     var fexcorePreset: String
-        get() = getPref(FEXCORE_PRESET, com.winlator.fexcore.FEXCorePreset.INTERMEDIATE)
+        get() = getPref(FEXCORE_PRESET, com.winlator.fexcore.FEXCorePreset.PERFORMANCE)
         set(value) {
             setPref(FEXCORE_PRESET, value)
         }

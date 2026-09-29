@@ -37,6 +37,18 @@ val copyDebugManifest by tasks.registering(Copy::class) {
     into(layout.buildDirectory.dir("generated/debugManifest"))
 }
 
+// XR releases retain the local Pico driver entry even when upstream/cached
+// manifests do not know about this fork's compatibility package yet.
+val copyXrManifest by tasks.registering(Copy::class) {
+    from(rootProject.file("manifest.json"))
+    rename { "xr-manifest.json" }
+    into(layout.buildDirectory.dir("generated/xrManifest"))
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.contains("Xr") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn(copyXrManifest)
+}
+
 android {
     namespace = "app.gamenative"
     compileSdk = 36
@@ -260,6 +272,7 @@ android {
             assets {
                 srcDirs("src/legacy/assets", "src/main/assets")
             }
+            assets.srcDir(layout.buildDirectory.dir("generated/xrManifest"))
             jniLibs {
                 srcDirs("src/legacy/jniLibs", "src/legacyXr/jniLibs")
             }
@@ -274,6 +287,7 @@ android {
             assets {
                 srcDirs("src/modern/assets", "src/main/assets")
             }
+            assets.srcDir(layout.buildDirectory.dir("generated/xrManifest"))
             jniLibs {
                 setSrcDirs(listOf("src/modern/jniLibs", "src/modernXr/jniLibs"))
             }

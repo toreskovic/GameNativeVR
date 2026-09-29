@@ -11,6 +11,8 @@ import app.gamenative.service.amazon.AmazonService
 import app.gamenative.service.epic.EpicService
 import app.gamenative.service.gog.GOGService
 import com.winlator.container.Container
+import com.winlator.box86_64.Box86_64Preset
+import com.winlator.fexcore.FEXCorePreset
 import com.winlator.container.ContainerData
 import com.winlator.container.ContainerManager
 import com.winlator.core.DefaultVersion
@@ -25,7 +27,6 @@ import com.winlator.xenvironment.ImageFs
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
 import timber.log.Timber
@@ -37,62 +38,28 @@ object ContainerUtils {
         val name: String,
     )
 
+    const val WRAPPER_PICO_A10 = DefaultVersion.PICO_TURNIP
+
     const val WRAPPER_TURNIP_CAPABLE = "Turnip v26.2.0 R4"
     const val WRAPPER_ADRENO_8ELITE_GEN5 = "Turnip Adreno Driver T26 (@Mr_Purple_666)"
     const val WRAPPER_ADRENO_8ELITE = "Turnip Gen8 V30"
     const val WRAPPER_ADRENO_A12 = "Turnip v26.1.0 A12 Fix"
 
     val wrapperDriverDefaults: List<String> =
-        listOf(WRAPPER_TURNIP_CAPABLE, WRAPPER_ADRENO_8ELITE_GEN5, WRAPPER_ADRENO_8ELITE, WRAPPER_ADRENO_A12)
+        listOf(WRAPPER_PICO_A10, WRAPPER_TURNIP_CAPABLE, WRAPPER_ADRENO_8ELITE_GEN5, WRAPPER_ADRENO_8ELITE, WRAPPER_ADRENO_A12)
 
     fun setContainerDefaults(context: Context) {
-        // Override default driver and DXVK version based on Turnip capability
-        if (GPUInformation.isTurnipCapable(context)) {
-            DefaultVersion.VARIANT = Container.BIONIC
-            DefaultVersion.WINE_VERSION = "proton-10.0-arm64ec-2"
-            DefaultVersion.DEFAULT_GRAPHICS_DRIVER = "Wrapper"
-            DefaultVersion.DXVK = if (GPUInformation.isAdreno6xx(context)) "1.11.1-sarek" else "2.4.1-gplasync"
-            DefaultVersion.VKD3D = "2.14.1"
-            DefaultVersion.WRAPPER = WRAPPER_TURNIP_CAPABLE
-            DefaultVersion.STEAM_TYPE = Container.STEAM_TYPE_HEADLESS
-            DefaultVersion.ASYNC_CACHE = "1"
-        } else if (GPUInformation.isAdrenoA12(context)) {
-            DefaultVersion.VARIANT = Container.BIONIC
-            DefaultVersion.WINE_VERSION = "proton-10.0-arm64ec-2"
-            DefaultVersion.DEFAULT_GRAPHICS_DRIVER = "Wrapper"
-            DefaultVersion.DXVK = "2.4.1-gplasync"
-            DefaultVersion.VKD3D = "2.14.1"
-            DefaultVersion.WRAPPER = WRAPPER_ADRENO_A12
-            DefaultVersion.STEAM_TYPE = Container.STEAM_TYPE_HEADLESS
-            DefaultVersion.ASYNC_CACHE = "1"
-        } else if (GPUInformation.isAdreno8EliteGen5(context)) {
-            DefaultVersion.VARIANT = Container.BIONIC
-            DefaultVersion.WINE_VERSION = "proton-10.0-arm64ec-2"
-            DefaultVersion.DEFAULT_GRAPHICS_DRIVER = "Wrapper"
-            DefaultVersion.DXVK = "2.4.1-gplasync"
-            DefaultVersion.VKD3D = "2.14.1"
-            DefaultVersion.WRAPPER = WRAPPER_ADRENO_8ELITE_GEN5
-            DefaultVersion.STEAM_TYPE = Container.STEAM_TYPE_HEADLESS
-            DefaultVersion.ASYNC_CACHE = "1"
-        } else if (GPUInformation.isAdreno8Elite(context)) {
-            DefaultVersion.VARIANT = Container.BIONIC
-            DefaultVersion.WINE_VERSION = "proton-10.0-arm64ec-2"
-            DefaultVersion.DEFAULT_GRAPHICS_DRIVER = "Wrapper"
-            DefaultVersion.DXVK = "2.4.1-gplasync"
-            DefaultVersion.VKD3D = "2.14.1"
-            DefaultVersion.WRAPPER = WRAPPER_ADRENO_8ELITE
-            DefaultVersion.STEAM_TYPE = Container.STEAM_TYPE_HEADLESS
-            DefaultVersion.ASYNC_CACHE = "1"
-        } else {
-            DefaultVersion.VARIANT = Container.BIONIC
-            DefaultVersion.WINE_VERSION = "proton-10.0-arm64ec-2"
-            DefaultVersion.DEFAULT_GRAPHICS_DRIVER =
-                if (GPUInformation.isAdrenoGPU(context)) "Wrapper" else "Wrapper-gamenative"
-            DefaultVersion.DXVK = "async-1.10.3"
-            DefaultVersion.VKD3D = "2.14.1"
-            DefaultVersion.STEAM_TYPE = Container.STEAM_TYPE_HEADLESS
-            DefaultVersion.ASYNC_CACHE = "0"
-        }
+        DefaultVersion.VARIANT = Container.BIONIC
+        DefaultVersion.WINE_VERSION = "proton-11.0-1-arm64ec-1"
+        DefaultVersion.DEFAULT_GRAPHICS_DRIVER = "Wrapper-gamenative"
+        DefaultVersion.DXVK = "2.7.1-1-gplasync-0"
+        DefaultVersion.VKD3D = "2.14.1"
+        DefaultVersion.WRAPPER = WRAPPER_PICO_A10
+        DefaultVersion.STEAM_TYPE = Container.STEAM_TYPE_HEADLESS
+        DefaultVersion.ASYNC_CACHE = if (
+            GPUInformation.isTurnipCapable(context) || GPUInformation.isAdrenoA12(context) ||
+            GPUInformation.isAdreno8EliteGen5(context) || GPUInformation.isAdreno8Elite(context)
+        ) "1" else "0"
     }
 
     fun getGPUCards(context: Context): Map<Int, GpuInfo> {
@@ -312,9 +279,10 @@ object ContainerUtils {
             xrRenderScale = container.xrRenderScale,
             xrFovScale = container.xrFovScale,
             xrFovBorder = container.xrFovBorder,
-            xrFoveation = container.xrFoveation,
             xrUpscaler = container.xrUpscaler,
             xrSgsrSharpness = container.xrSgsrSharpness,
+            xrForceDisableMsaa = container.isXrForceDisableMsaa,
+            xrFoveation = container.xrFoveation,
             sfCompatMode = container.sfCompatMode,
             dxwrapper = container.dxWrapper,
             dxwrapperConfig = container.dxWrapperConfig,
@@ -508,9 +476,10 @@ object ContainerUtils {
         container.xrRenderScale = containerData.xrRenderScale
         container.xrFovScale = containerData.xrFovScale
         container.xrFovBorder = containerData.xrFovBorder
-        container.xrFoveation = containerData.xrFoveation
         container.xrUpscaler = containerData.xrUpscaler
         container.xrSgsrSharpness = containerData.xrSgsrSharpness
+        container.isXrForceDisableMsaa = containerData.xrForceDisableMsaa
+        container.xrFoveation = containerData.xrFoveation
         container.sfCompatMode = containerData.sfCompatMode
         container.dxWrapper = containerData.dxwrapper
         container.dxWrapperConfig = containerData.dxwrapperConfig
@@ -965,10 +934,27 @@ object ContainerUtils {
             containerData
         }
 
-        if (BuildConfig.XR_BUILD) {
+        // Defaults for every newly created container in this headset-only fork.
+        // Preserve explicit imported/custom configurations and existing containers.
+        if (customConfig == null) {
             val kvs = KeyValueSet(containerData.graphicsDriverConfig)
-            kvs.put("adrenotoolsTurnip", "0")
-            containerData = containerData.copy(graphicsDriverConfig = kvs.toString())
+            kvs.put("version", WRAPPER_PICO_A10)
+            kvs.put("adrenotoolsTurnip", "1")
+            val dxvkConfig = KeyValueSet(containerData.dxwrapperConfig)
+            dxvkConfig.put("version", DefaultVersion.DXVK)
+            containerData = containerData.copy(
+                wineVersion = DefaultVersion.WINE_VERSION,
+                graphicsDriver = "Wrapper-gamenative",
+                graphicsDriverConfig = kvs.toString(),
+                dxwrapper = "dxvk",
+                dxwrapperConfig = dxvkConfig.toString(),
+                fexcoreVersion = DefaultVersion.FEXCORE,
+                box64Preset = Box86_64Preset.UNITY_MONO_BLEEDING_EDGE,
+                fexcorePreset = FEXCorePreset.PERFORMANCE,
+                xrRenderScale = 70,
+                xrFoveation = 1, // Conservative
+                xrUpscaler = 2, // SGSR 1
+            )
         }
 
         if (Build.MANUFACTURER.equals("samsung", ignoreCase = true) && GPUInformation.isAdreno740(context)) {
@@ -986,50 +972,7 @@ object ContainerUtils {
             return container
         }
 
-        // No custom config, so determine the DX wrapper synchronously (only for Steam games)
-        // For GOG and Custom Games, use the default DX wrapper from preferences
-        if (gameSource == GameSource.STEAM) {
-            runBlocking {
-                try {
-                    Timber.i("Fetching DirectX version synchronously for app $appId")
-
-                    val gameId = extractGameIdFromContainerId(appId)
-                    // Create CompletableDeferred to wait for result
-                    val deferred = kotlinx.coroutines.CompletableDeferred<Int>()
-
-                    // Start the async fetch but wait for it to complete
-                    SteamUtils.fetchDirect3DMajor(gameId) { dxVersion ->
-                        deferred.complete(dxVersion)
-                    }
-
-                    // Wait for the result with a timeout
-                    val dxVersion = try {
-                        withTimeout(10000) { deferred.await() }
-                    } catch (e: Exception) {
-                        Timber.w(e, "Timeout waiting for DirectX version")
-                        -1 // Default on timeout
-                    }
-
-                    // Set wrapper based on DirectX version
-                    val newDxWrapper = when {
-                        dxVersion == 12 -> "vkd3d"
-                        dxVersion in 1..8 -> "wined3d"
-                        else -> containerData.dxwrapper // Keep existing for DX10/11 or errors
-                    }
-
-                    // Update the wrapper if needed
-                    if (newDxWrapper != containerData.dxwrapper) {
-                        Timber.i("Setting DX wrapper for app $appId to $newDxWrapper (DirectX version: $dxVersion)")
-                        containerData.dxwrapper = newDxWrapper
-                    }
-                } catch (e: Exception) {
-                    Timber.w(e, "Error determining DirectX version: ${e.message}")
-                    // Continue with default wrapper on error
-                }
-            }
-        }
-
-        // Apply container data with the determined DX wrapper
+        // Keep the requested DXVK default instead of replacing it using Steam metadata.
         applyToContainer(context, container, containerData)
         SessionReport.markConfigApplied(container, if (bestConfigMap.isNullOrEmpty()) "default" else "known")
         return container

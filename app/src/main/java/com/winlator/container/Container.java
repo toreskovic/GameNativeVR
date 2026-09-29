@@ -46,7 +46,7 @@ public class Container {
     public static final String DEFAULT_DISPLAY_RENDERER = "vulkan";
     public static final String DEFAULT_DDRAWRAPPER = "none";
     public static final String DEFAULT_DXWRAPPERCONFIG = "version=" + DefaultVersion.DXVK + ",framerate=0,maxDeviceMemory=0,async=" + DefaultVersion.ASYNC + ",asyncCache=" + DefaultVersion.ASYNC_CACHE + ",vkd3dVersion=" + DefaultVersion.VKD3D + ",vkd3dLevel=12_1" + ",ddrawrapper=" + Container.DEFAULT_DDRAWRAPPER + ",csmt=3" + ",gpuName=NVIDIA GeForce GTX 480" + ",videoMemorySize=2048" + ",strict_shader_math=1" + ",OffscreenRenderingMode=fbo" + ",renderer=gl";;
-    public static final String DEFAULT_GRAPHICSDRIVERCONFIG = "vulkanVersion=1.3" + ",version=" + DefaultVersion.WRAPPER + ",blacklistedExtensions=" + ",maxDeviceMemory=0" + ",presentMode=mailbox" + ",syncFrame=0" + ",disablePresentWait=0" + ",resourceType=auto" + ",bcnEmulation=auto" + ",bcnEmulationType=compute" + ",bcnEmulationCache=0" + ",gpuName=Device";
+    public static final String DEFAULT_GRAPHICSDRIVERCONFIG = "vulkanVersion=1.3,adrenotoolsTurnip=1" + ",version=" + DefaultVersion.WRAPPER + ",blacklistedExtensions=" + ",maxDeviceMemory=0" + ",presentMode=mailbox" + ",syncFrame=0" + ",disablePresentWait=0" + ",resourceType=auto" + ",bcnEmulation=auto" + ",bcnEmulationType=compute" + ",bcnEmulationCache=0" + ",gpuName=Device";
     public static final String DEFAULT_WINCOMPONENTS = "direct3d=1,directsound=1,directinput8=0,directinput=0,directmusic=0,directshow=0,directplay=0,vcrun2010=1,wmdecoder=1,opengl=0";
     public static final String FALLBACK_WINCOMPONENTS = "direct3d=1,directsound=1,directinput8=0,directinput=0,directmusic=1,directshow=1,directplay=1,vcrun2010=1,wmdecoder=1,opengl=0";
     public static final String[] MEDIACONV_ENV_VARS = {
@@ -87,19 +87,20 @@ public class Container {
     private String rendererPresentMode = "fifo";
     private String displayRenderer = Container.DEFAULT_DISPLAY_RENDERER;
     private int xrRefreshRate = 72;
-    private int xrRenderScale = 100;
+    private int xrRenderScale = 70;
     private int xrFovScale = 100;
     private int xrFovBorder = 0; // Black, Extend, Blurred
-    private int xrFoveation = 1; // Off, Conservative (default), Aggressive
     // Stable saved IDs: 0 = bilinear, 1 = retired FSR, 2 = SGSR, 3 = SGSR edge direction.
     private int xrUpscaler = 2; // SGSR 1
     private int xrSgsrSharpness = 70; // hundredths: 50 = 0.5 blend, 100 = 1.0, 200 = 2.0
+    private boolean xrForceDisableMsaa = true;
+    private int xrFoveation = 1; // Off, Conservative (default), Aggressive
     private boolean sfCompatMode = true;
     private String wincomponents = DEFAULT_WINCOMPONENTS;
     private String audioDriver = DEFAULT_AUDIO_DRIVER;
     private boolean pulseaudioLowLatency = false;
     private String drives = DEFAULT_DRIVES;
-    private String wineVersion = WineInfo.MAIN_WINE_VERSION.identifier();
+    private String wineVersion = DefaultVersion.WINE_VERSION;
     private boolean showFPS;
     private boolean launchImmersiveMode = app.gamenative.BuildConfig.XR_BUILD;
     private boolean launchRealSteam;
@@ -114,9 +115,9 @@ public class Container {
     private String box86Version = DefaultVersion.BOX86;
     private String box64Version = DefaultVersion.BOX64;
     private String box86Preset = Box86_64Preset.PERFORMANCE;
-    private String box64Preset = Box86_64Preset.PERFORMANCE;
+    private String box64Preset = Box86_64Preset.UNITY_MONO_BLEEDING_EDGE;
     private String fexcoreVersion = DefaultVersion.FEXCORE;
-    private String fexcorePreset = FEXCorePreset.INTERMEDIATE;
+    private String fexcorePreset = FEXCorePreset.PERFORMANCE;
     private String emulator = DEFAULT_EMULATOR;
     private File rootDir;
     private String installPath = "";
@@ -298,6 +299,10 @@ public class Container {
     public int getXrRefreshRate() { return xrRefreshRate; }
 
     public void setXrRefreshRate(int v) { this.xrRefreshRate = v; }
+
+    public boolean isXrForceDisableMsaa() { return xrForceDisableMsaa; }
+
+    public void setXrForceDisableMsaa(boolean value) { xrForceDisableMsaa = value; }
 
     public int getXrFoveation() { return xrFoveation; }
 
@@ -772,9 +777,10 @@ public class Container {
             data.put("xrRenderScale", xrRenderScale);
             data.put("xrFovScale", xrFovScale);
             data.put("xrFovBorder", xrFovBorder);
-            data.put("xrFoveation", xrFoveation);
             data.put("xrUpscaler", xrUpscaler);
             data.put("xrSgsrSharpness", xrSgsrSharpness);
+            data.put("xrForceDisableMsaa", xrForceDisableMsaa);
+            data.put("xrFoveation", xrFoveation);
             data.put("sfCompatMode", sfCompatMode);
             data.put("dxwrapper", dxwrapper);
             if (!dxwrapperConfig.isEmpty()) data.put("dxwrapperConfig", dxwrapperConfig);
@@ -912,6 +918,9 @@ public class Container {
                     break;
                 case "xrRefreshRate" :
                     setXrRefreshRate(data.getInt(key));
+                    break;
+                case "xrForceDisableMsaa" :
+                    setXrForceDisableMsaa(data.getBoolean(key));
                     break;
                 case "xrFoveation" :
                     setXrFoveation(data.getInt(key));
