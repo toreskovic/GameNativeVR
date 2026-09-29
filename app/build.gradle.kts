@@ -45,10 +45,6 @@ val copyXrManifest by tasks.registering(Copy::class) {
     into(layout.buildDirectory.dir("generated/xrManifest"))
 }
 
-tasks.matching { it.name.startsWith("merge") && it.name.contains("Xr") && it.name.endsWith("Assets") }.configureEach {
-    dependsOn(copyXrManifest)
-}
-
 android {
     namespace = "app.gamenative"
     compileSdk = 36
@@ -281,7 +277,7 @@ android {
             assets {
                 srcDirs("src/legacy/assets", "src/main/assets")
             }
-            assets.srcDir(layout.buildDirectory.dir("generated/xrManifest"))
+            assets.srcDir(copyXrManifest)
             jniLibs {
                 srcDirs("src/legacy/jniLibs", "src/legacyXr/jniLibs")
             }
@@ -296,7 +292,7 @@ android {
             assets {
                 srcDirs("src/modern/assets", "src/main/assets")
             }
-            assets.srcDir(layout.buildDirectory.dir("generated/xrManifest"))
+            assets.srcDir(copyXrManifest)
             jniLibs {
                 setSrcDirs(listOf("src/modern/jniLibs", "src/modernXr/jniLibs"))
             }
