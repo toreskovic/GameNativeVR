@@ -91,6 +91,7 @@ object ContainerUtils {
             dxwrapperConfig = PrefManager.dxWrapperConfig,
             audioDriver = PrefManager.audioDriver,
             pulseaudioLowLatency = PrefManager.pulseaudioLowLatency,
+            micEnabled = PrefManager.micEnabled,
             wincomponents = PrefManager.winComponents,
             drives = PrefManager.drives,
             execArgs = PrefManager.execArgs,
@@ -159,6 +160,7 @@ object ContainerUtils {
         PrefManager.dxWrapperConfig = containerData.dxwrapperConfig
         PrefManager.audioDriver = containerData.audioDriver
         PrefManager.pulseaudioLowLatency = containerData.pulseaudioLowLatency
+        PrefManager.micEnabled = containerData.micEnabled
         PrefManager.winComponents = containerData.wincomponents
         PrefManager.drives = containerData.drives
         PrefManager.execArgs = containerData.execArgs
@@ -288,6 +290,7 @@ object ContainerUtils {
             dxwrapperConfig = container.dxWrapperConfig,
             audioDriver = container.audioDriver,
             pulseaudioLowLatency = container.getPulseaudioLowLatency(),
+            micEnabled = container.getMicEnabled(),
             wincomponents = container.winComponents,
             drives = container.drives,
             execArgs = container.execArgs,
@@ -485,6 +488,7 @@ object ContainerUtils {
         container.dxWrapperConfig = containerData.dxwrapperConfig
         container.audioDriver = containerData.audioDriver
         container.setPulseaudioLowLatency(containerData.pulseaudioLowLatency)
+        container.setMicEnabled(containerData.micEnabled)
         container.winComponents = containerData.wincomponents
         container.drives = containerData.drives
         container.execArgs = containerData.execArgs
@@ -826,6 +830,7 @@ object ContainerUtils {
                     runBlocking(Dispatchers.IO) {
                         try {
                             val bestConfig = BestConfigService.fetchBestConfig(
+                                context = context,
                                 gameName = gameName,
                                 gpuName = gpuName,
                                 gameStore = gameSource.name,
@@ -879,6 +884,7 @@ object ContainerUtils {
                 dxwrapperConfig = PrefManager.dxWrapperConfig,
                 audioDriver = PrefManager.audioDriver,
                 pulseaudioLowLatency = PrefManager.pulseaudioLowLatency,
+                micEnabled = PrefManager.micEnabled,
                 wincomponents = PrefManager.winComponents,
                 drives = drives,
                 execArgs = PrefManager.execArgs,
@@ -1026,7 +1032,7 @@ object ContainerUtils {
         }
 
         val resolvedGameFolderPath = if (gameSource == GameSource.CUSTOM_GAME) {
-            gameFolderPath
+            CustomGameScanner.migrateFromPublicRoot(gameFolderPath)
         } else {
             StorageUtils.resolveLegacyGameDir(gameFolderPath)
         }

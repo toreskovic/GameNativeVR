@@ -98,6 +98,7 @@ import app.gamenative.data.GyroSettings
 import app.gamenative.gamefixes.GameFixesRegistry
 import app.gamenative.gamefixes.GameInputCompatibility
 import app.gamenative.data.LaunchInfo
+import app.gamenative.filedetect.GameFileDetection
 import app.gamenative.data.LibraryItem
 import app.gamenative.data.ShooterModeConfig
 import app.gamenative.data.SteamApp
@@ -139,6 +140,7 @@ import app.gamenative.utils.LsfgVkManager
 import app.gamenative.utils.ManifestComponentHelper
 import app.gamenative.utils.WindowActivity
 import app.gamenative.utils.PerfSampler
+import app.gamenative.utils.GameCompatibilityService
 import app.gamenative.utils.SessionReport
 import app.gamenative.utils.launchdependencies.BionicSteamAssetsDependency
 import app.gamenative.utils.downloader.DXWrapperDownloader
@@ -156,6 +158,7 @@ import app.gamenative.utils.WineProcessSnapshotHelper
 import com.posthog.PostHog
 import com.winlator.alsaserver.ALSAClient
 import com.winlator.container.Container
+import com.winlator.container.ContainerDeduper
 import com.winlator.container.ContainerManager
 import com.winlator.contents.AdrenotoolsManager
 import com.winlator.contents.ContentProfile
@@ -170,6 +173,7 @@ import com.winlator.core.GPUInformation
 import com.winlator.core.KeyValueSet
 import com.winlator.core.OnExtractFileListener
 import com.winlator.core.ProcessHelper
+import com.winlator.core.SharedComponents
 import com.winlator.core.TarCompressorUtils
 import com.winlator.core.Win32AppWorkarounds
 import com.winlator.core.WineInfo
@@ -206,6 +210,7 @@ import com.winlator.xenvironment.components.BionicProgramLauncherComponent
 import com.winlator.xenvironment.components.GlibcProgramLauncherComponent
 import com.winlator.xenvironment.components.GuestProgramLauncherComponent
 import com.winlator.xenvironment.components.NetworkInfoUpdateComponent
+import com.winlator.xenvironment.components.MicrophoneComponent
 import com.winlator.xenvironment.components.PulseAudioComponent
 import com.winlator.xenvironment.components.SteamClientComponent
 import com.winlator.xenvironment.components.SysVSharedMemoryComponent
@@ -244,6 +249,7 @@ import java.util.Arrays
 import java.util.Locale
 import kotlin.math.ceil
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 import kotlin.io.path.name
 import kotlin.math.roundToInt
 import kotlin.text.lowercase
@@ -3834,6 +3840,10 @@ private fun shiftXEnvironmentToContext(
     if (pulseComponent != null) {
         environment.addComponent(pulseComponent)
     }
+    val micComponent = xEnvironment.getComponent<MicrophoneComponent>(MicrophoneComponent::class.java)
+    if (micComponent != null) {
+        environment.addComponent(micComponent)
+    }
     var virglComponent: VirGLRendererComponent? =
         xEnvironment.getComponent<VirGLRendererComponent>(VirGLRendererComponent::class.java)
     if (virglComponent != null) {
@@ -3871,10 +3881,25 @@ private fun runSteamHostCegPass(
 
     val resultFile = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/steamhost_ceg_result")
     resultFile.delete()
+    val progressFile = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/steamhost_ceg")
+    progressFile.delete()
     val batch = File(imageFs.wineprefix, "drive_c/steamhost_ceg.bat")
     batch.writeText("@\"C:\\Program Files (x86)\\Steam\\steam.exe\"\r\n")
     PluviaApp.events.emit(AndroidEvent.SetBootingSplashText("Preparing game executable..."))
     launcher.envVars.put("STEAMHOST_CEG_ONLY", "1")
+    val passStartedAt = System.currentTimeMillis()
+    val pollProgress = AtomicBoolean(true)
+    thread(name = "steamhost-ceg-progress") {
+        var lastText = ""
+        while (pollProgress.get()) {
+            val text = cegSplashText(progressFile, passStartedAt)
+            if (text != lastText) {
+                lastText = text
+                PluviaApp.events.emit(AndroidEvent.SetBootingSplashText(text))
+            }
+            Thread.sleep(500)
+        }
+    }
     try {
         Timber.i("Running steamhost CEG pass for $steamAppId")
         val output = launcher.execShellCommand("wine cmd /c C:\\steamhost_ceg.bat && wineserver -k")
@@ -3882,6 +3907,7 @@ private fun runSteamHostCegPass(
     } catch (e: Exception) {
         Timber.e(e, "steamhost CEG pass failed to run")
     } finally {
+        pollProgress.set(false)
         launcher.envVars.remove("STEAMHOST_CEG_ONLY")
     }
     val result = runCatching { resultFile.readText().trim() }.getOrDefault("")
@@ -3891,6 +3917,25 @@ private fun runSteamHostCegPass(
     } else {
         onGameLaunchError?.invoke("Steam could not prepare the game executable (${result.ifEmpty { "steamhost gave no result" }})")
     }
+}
+
+private fun cegSplashText(progressFile: File, startedAt: Long): String {
+    val elapsed = (System.currentTimeMillis() - startedAt) / 1000
+    val fields = runCatching { progressFile.readText().trim().split(' ') }.getOrNull()
+    if (fields == null || fields.size < 6) {
+        return "Preparing game executable... signing in to Steam (${elapsed}s)"
+    }
+    val jobsDone = fields[1].toIntOrNull() ?: 0
+    val jobs = fields[2].toIntOrNull() ?: 0
+    val bytes = fields[3].toLongOrNull() ?: 0L
+    val total = fields[4].toLongOrNull() ?: 0L
+    val progress = if (total > 0) {
+        "downloading %.1f / %.1f MB".format(bytes / 1_000_000.0, total / 1_000_000.0)
+    } else {
+        "waiting for Steam's DRM service"
+    }
+    val files = if (jobs > 1) ", file ${(jobsDone + 1).coerceAtMost(jobs)} of $jobs" else ""
+    return "Preparing game executable... $progress$files (${elapsed}s)"
 }
 
 private fun setupXEnvironment(
@@ -4148,17 +4193,41 @@ private fun setupXEnvironment(
     // environment.addComponent(SteamClientComponent(UnixSocketConfig.createSocket(SteamService.getAppDirPath(appId), "/steam_pipe")))
     // environment.addComponent(SteamClientComponent(UnixSocketConfig.createSocket(rootPath, UnixSocketConfig.STEAM_PIPE_PATH)))
 
+    // Microphone support is published through PulseAudio (module-pipe-source), which Wine/Proton's
+    // winepulse.drv enumerates as a normal recording device. Opt-in per container.
+    val micEnabled = container.getMicEnabled() && PulseAudioComponent.isMicModuleAvailable(context)
+    if (container.getMicEnabled() && !micEnabled) {
+        Timber.w("Microphone enabled for this container but module-pipe-source.so is missing; skipping")
+    }
+
     if (xServerState.value.audioDriver == "alsa") {
         envVars.put("ANDROID_ALSA_SERVER", imageFs.getRootDir().getPath() + UnixSocketConfig.ALSA_SERVER_PATH)
         envVars.put("ANDROID_ASERVER_USE_SHM", "true")
         val options = ALSAClient.Options.fromKeyValueSet(null)
         environment.addComponent(ALSAServerComponent(UnixSocketConfig.createSocket(imageFs.getRootDir().getPath(), UnixSocketConfig.ALSA_SERVER_PATH), options))
+        if (micEnabled) {
+            // Playback stays on the ALSA server; run PulseAudio in mic-only mode (no AAudio sink, so
+            // no extra output path and no added playback latency) purely to expose the capture device.
+            envVars.put("PULSE_SERVER", imageFs.getRootDir().getPath() + UnixSocketConfig.PULSE_SERVER_PATH)
+            environment.addComponent(PulseAudioComponent(
+                UnixSocketConfig.createSocket(imageFs.getRootDir().getPath(), UnixSocketConfig.PULSE_SERVER_PATH),
+                container.pulseaudioLowLatency,
+                true,
+                false
+            ))
+        }
     } else if (xServerState.value.audioDriver == "pulseaudio") {
         envVars.put("PULSE_SERVER", imageFs.getRootDir().getPath() + UnixSocketConfig.PULSE_SERVER_PATH)
         environment.addComponent(PulseAudioComponent(
             UnixSocketConfig.createSocket(imageFs.getRootDir().getPath(), UnixSocketConfig.PULSE_SERVER_PATH),
-            container.pulseaudioLowLatency
+            container.pulseaudioLowLatency,
+            micEnabled,
+            true
         ))
+    }
+
+    if (micEnabled) {
+        environment.addComponent(MicrophoneComponent(PulseAudioComponent.getMicFifoFile(context)))
     }
 
     if (xServerState.value.graphicsDriver == "virgl") {
@@ -4299,6 +4368,9 @@ private fun setupXEnvironment(
         immersiveHooks?.windowsVr?.beforeGuestProcessStart()
         environment.startEnvironmentComponents()
         immersiveHooks?.windowsVr?.onEnvironmentStarted()
+        if (container != null && !bootToContainer) {
+            CoroutineScope(Dispatchers.IO).launch { GameFileDetection.ensure(context, container) }
+        }
     } catch (e: Exception) {
         Timber.e(e, "Failed to start environment components, cleaning up")
         try {
@@ -4795,6 +4867,7 @@ private fun getWineStartCommand(
                 )
             }
             envVars.put("PROTON_DISABLE_LSTEAMCLIENT", "1")
+            envVars.put("PROTON_LIMIT_ADDRESS_SPACE", "1")
             if (offline || container.isSteamOfflineMode) envVars.put("STEAMHOST_OFFLINE", "1")
             envVars.put("STEAMHOST_ACCOUNT", PrefManager.username)
             envVars.put("STEAMHOST_TOKEN", SteamHostAuth.seal(context.packageName, PrefManager.refreshToken))
@@ -4807,7 +4880,7 @@ private fun getWineStartCommand(
                 val launcher = "$steamRoot\\steamapps\\common\\$gameFolderName\\$normalizedExe"
                 envVars.put("STEAMHOST_LAUNCH_PARAMS", "-forceLauncherPath \"$launcher\" -skipInstallers")
             }
-            if (container.getExtra("useSteamInput", "false").toBoolean()) envVars.put("STEAMHOST_STEAMINPUT", "1")
+            if (SteamUtils.isSteamInputEnabled(container, gameId)) envVars.put("STEAMHOST_STEAMINPUT", "1")
             Timber.i("Real-Steam via steamhost: game=$gameCmd dir=$gameDir")
             "\"C:\\\\Program Files (x86)\\\\Steam\\\\steam.exe\""
         } else {
@@ -4891,18 +4964,22 @@ private fun exit(
 
     PerfSampler.halt()
 
+    val exitProperties = mapOf(
+        "game_name" to ContainerUtils.resolveGameName(appId),
+        "game_store" to ContainerUtils.extractGameSourceFromContainerId(appId).name,
+        "session_length" to (frameRating?.sessionLengthSec ?: 0),
+        "avg_fps" to (frameRating?.avgFPS ?: 0.0),
+        "container_config" to container.containerJson,
+    ) + runCatching {
+        SessionReport.exitProperties(frameRating?.context ?: PluviaApp.xServerView?.context, frameRating, windowActivity, container, reason)
+    }.getOrElse { emptyMap() } + runCatching {
+        GameCompatibilityService.badgeProperties(ContainerUtils.resolveGameName(appId))
+    }.getOrElse { emptyMap() }
     PostHog.capture(
         event = "game_exited",
-        properties = mapOf(
-            "game_name" to ContainerUtils.resolveGameName(appId),
-            "game_store" to ContainerUtils.extractGameSourceFromContainerId(appId).name,
-            "session_length" to (frameRating?.sessionLengthSec ?: 0),
-            "avg_fps" to (frameRating?.avgFPS ?: 0.0),
-            "container_config" to container.containerJson,
-        ) + runCatching {
-            SessionReport.exitProperties(frameRating?.context ?: PluviaApp.xServerView?.context, frameRating, windowActivity, container, reason)
-        }.getOrElse { emptyMap() },
+        properties = exitProperties,
     )
+    CoroutineScope(Dispatchers.IO).launch { SessionReport.recordRun(container, exitProperties) }
     runCatching { windowActivity.stop() }
 
     // Store session data in container metadata
@@ -5091,7 +5168,9 @@ private fun unpackExecutableFile(
         val rootDir: File = imageFs.getRootDir()
 
         try {
-            PluviaApp.events.emit(AndroidEvent.SetBootingSplashText("Handling DRM..."))
+            if (!container.isLaunchRealSteam && !container.isLaunchBionicSteam) {
+                PluviaApp.events.emit(AndroidEvent.SetBootingSplashText("Handling DRM..."))
+            }
             // a:/.../GameDir/orig_dll_path.txt  (same dir as the EXE inside A:)
             val origTxtFile  = File("${imageFs.wineprefix}/dosdevices/a:/orig_dll_path.txt")
 
@@ -5307,6 +5386,12 @@ private suspend fun setupWineSystemFiles(
         containerDataChanged = true
     }
 
+    if (!ContainerDeduper.isDone(container)) {
+        val dedupe = ContainerDeduper.dedupe(context, contentsManager, container)
+        Timber.i("Container dedupe: $dedupe")
+        if (dedupe.completed) ContainerDeduper.markDone(container)
+    }
+
     // Always refresh components files
     refreshComponentsFiles(context)
 
@@ -5486,7 +5571,7 @@ private suspend fun applyGeneralPatches(
 
 private fun refreshComponentsFiles(context: Context) {
     val extractionPairs = listOf(
-        "pulseaudio-gamenative-20260612.tzst" to File(context.filesDir, "pulseaudio")
+        "pulseaudio-gamenative-20260919.tzst" to File(context.filesDir, "pulseaudio")
     )
 
     AssetUtils.extractComponentsWithVersionCheck(
@@ -5549,16 +5634,16 @@ private suspend fun extractDXWrapperComponent(
     if (componentFile == null) {
         // Legacy variant: use bundled asset
         Timber.d("Extracting dxwrapper $componentId from bundled assets")
-        TarCompressorUtils.extract(
-            TarCompressorUtils.Type.ZSTD, context.assets,
+        SharedComponents.extractAndLink(
+            context, componentId, TarCompressorUtils.Type.ZSTD,
             "dxwrapper/$componentId.tzst", windowsDir, onExtractFileListener,
         )
     } else {
         // Modern variant: use downloaded file
         Timber.d("Extracting dxwrapper $componentId from downloaded file: ${componentFile.absolutePath}")
-        TarCompressorUtils.extract(
-            TarCompressorUtils.Type.ZSTD, componentFile,
-            windowsDir, onExtractFileListener,
+        SharedComponents.extractAndLink(
+            context, componentId, TarCompressorUtils.Type.ZSTD,
+            componentFile, windowsDir, onExtractFileListener,
         )
     }
 }
