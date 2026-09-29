@@ -143,6 +143,10 @@ static void log_line(const char *line)
     fclose(f);
 }
 
+#if defined(__ANDROID__)
+#include "gamenative_ahb.h"
+#endif
+
 static void log_vulkan_context_state(void)
 {
     char line[384];
@@ -525,8 +529,8 @@ static int ahb_transport_probe(void)
     };
     AHardwareBuffer *buffer = NULL;
     if (p_vkGetAndroidHardwareBufferPropertiesANDROID && command_pool &&
-        p_vkCmdCopyImage && AHardwareBuffer_allocate(&descriptor, &buffer) == 0 && buffer) {
-        AHardwareBuffer_release(buffer);
+        p_vkCmdCopyImage && gn_ahb_allocate(&descriptor, &buffer) == 0 && buffer) {
+        gn_ahb_release(buffer);
         cached = 1;
         log_line("AHardwareBuffer transport available; using optimal-tiling render targets");
     } else {
@@ -902,6 +906,7 @@ static PFN_vkGetInstanceProcAddr relay_open_hal(void *lib, const char *path)
 
 static int relay_init(void)
 {
+    if (!gn_ahb_available()) return 0;
     if (relay_state) return relay_state > 0;
     relay_state = -1;
 
@@ -1227,7 +1232,7 @@ static int relay_create_transport(
                  AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT
     };
     AHardwareBuffer *buffer = NULL;
-    if (AHardwareBuffer_allocate(&descriptor, &buffer) != 0 || !buffer) {
+    if (gn_ahb_allocate(&descriptor, &buffer) != 0 || !buffer) {
         log_line("relay: AHardwareBuffer allocation failed");
         return 0;
     }
@@ -1439,7 +1444,7 @@ static int relay_register(uint32_t slot, uint32_t image_index, uint32_t eye)
              swap_red_blue ? 1u : 0u);
     if (!transact_line(line, response, sizeof(response)) ||
         strncmp(response, "OK", 2) ||
-        AHardwareBuffer_sendHandleToUnixSocket(
+        gn_ahb_send(
             (AHardwareBuffer *)transport->hardware_buffer, transport_fd) != 0 ||
         !read_line(transport_fd, response, sizeof(response)) ||
         strncmp(response, "OK", 2)) {
@@ -1469,7 +1474,7 @@ static void destroy_transport_image(struct gn_transport_image *transport)
         if (transport->image) r_vkDestroyImage(relay_device, transport->image, NULL);
         if (transport->memory) r_vkFreeMemory(relay_device, transport->memory, NULL);
         if (transport->hardware_buffer)
-            AHardwareBuffer_release((AHardwareBuffer *)transport->hardware_buffer);
+            gn_ahb_release((AHardwareBuffer *)transport->hardware_buffer);
         memset(transport, 0, sizeof(*transport));
         return;
     }
@@ -1482,7 +1487,7 @@ static void destroy_transport_image(struct gn_transport_image *transport)
         p_vkFreeMemory(device, transport->memory, NULL);
 #if defined(__ANDROID__)
     if (transport->hardware_buffer)
-        AHardwareBuffer_release((AHardwareBuffer *)transport->hardware_buffer);
+        gn_ahb_release((AHardwareBuffer *)transport->hardware_buffer);
 #endif
     memset(transport, 0, sizeof(*transport));
 }
@@ -1506,7 +1511,7 @@ static int create_ahardwarebuffer_transport(
                  AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT
     };
     AHardwareBuffer *buffer = NULL;
-    if (AHardwareBuffer_allocate(&descriptor, &buffer) != 0 || !buffer) {
+    if (gn_ahb_allocate(&descriptor, &buffer) != 0 || !buffer) {
         log_line("AHardwareBuffer allocation unavailable; using dma-buf fallback");
         return 0;
     }
@@ -1772,7 +1777,7 @@ static int register_ahardwarebuffer(
              swap_red_blue ? 1u : 0u);
     if (!transact_line(line, response, sizeof(response)) ||
         strncmp(response, "OK", 2) ||
-        AHardwareBuffer_sendHandleToUnixSocket(
+        gn_ahb_send(
             (AHardwareBuffer *)transport->hardware_buffer,
             transport_fd) != 0 ||
         !read_line(transport_fd, response, sizeof(response)) ||
@@ -1990,6 +1995,9 @@ static int32_t unix_init(void *opaque)
     args->result = args->abi_version == GN_UNIX_ABI_VERSION ?
         GN_UNIX_SUCCESS : GN_UNIX_ERROR_ARGUMENT;
     log_line("unixlib initialized");
+#if defined(__ANDROID__)
+    if (args->result == GN_UNIX_SUCCESS) gn_ahb_available();
+#endif
     return 0;
 }
 

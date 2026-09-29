@@ -28,6 +28,9 @@ typedef enum D3D_FEATURE_LEVEL {
 #include <openxr/openxr_loader_negotiation.h>
 #include "gamenative_openxr_unix.h"
 
+#include "gamenative_xr_clock.h"
+#define GN_WIN32_TIME_EXTENSION "XR_KHR_win32_convert_performance_counter_time"
+
 #define XR_KHR_D3D11_enable_SPEC_VERSION 11
 #define XR_KHR_D3D11_ENABLE_EXTENSION_NAME "XR_KHR_D3D11_enable"
 #define XR_KHR_vulkan_enable_SPEC_VERSION 10
@@ -245,6 +248,10 @@ GN_IMPORT void GN_STDCALL OutputDebugStringA(const char* text);
 GN_IMPORT void* GN_STDCALL LoadLibraryA(const char* name);
 GN_IMPORT void* GN_STDCALL GetProcAddress(void* module, const char* name);
 GN_IMPORT unsigned long GN_STDCALL GetLastError(void);
+// LARGE_INTEGER's ABI is an aligned signed 64-bit value on both Windows targets.
+typedef union { long long QuadPart; } GnLargeInteger;
+GN_IMPORT int GN_STDCALL QueryPerformanceCounter(GnLargeInteger* value);
+GN_IMPORT int GN_STDCALL QueryPerformanceFrequency(GnLargeInteger* value);
 GN_IMPORT long GN_STDCALL CreateDXGIFactory(const void* iid, void** factory);
 
 typedef int gn_ntstatus;
@@ -1617,7 +1624,7 @@ static XrResult XRAPI_CALL gn_xrEnumerateInstanceExtensionProperties(
     gn_uint32* propertyCountOutput,
     XrExtensionProperties* properties) {
     (void)layerName;
-    const gn_uint32 available = 4;
+    const gn_uint32 available = 5;
     if (!propertyCountOutput) return XR_ERROR_VALIDATION_FAILURE;
     if (propertyCapacityInput != 0 && properties == NULL) return XR_ERROR_VALIDATION_FAILURE;
     XrResult r = gn_copy_props(available, propertyCapacityInput, propertyCountOutput);
@@ -1632,11 +1639,77 @@ static XrResult XRAPI_CALL gn_xrEnumerateInstanceExtensionProperties(
     if (propertyCapacityInput > 3) {
         gn_write_extension(&properties[3], XR_KHR_D3D12_ENABLE_EXTENSION_NAME, XR_KHR_D3D12_enable_SPEC_VERSION);
     }
+    if (propertyCapacityInput > 4) {
+        gn_write_extension(&properties[4], GN_WIN32_TIME_EXTENSION, 1);
+    }
     return XR_SUCCESS;
+}
+
+static volatile int gn_clock_lock = 0;
+static int gn_clock_ready = 0;
+static int gn_clock_enabled = 0;
+static GnXrClock gn_clock;
+
+// Calibrate against an actual headset XrTime, never a predicted future frame time.
+// Pick the shortest of five round trips to minimize scheduling/transport uncertainty.
+static int gn_prepare_clock(void) {
+    GnLargeInteger frequency, before, after;
+    char response[128];
+    long long best = 0x7fffffffffffffffLL;
+    if (gn_clock_ready) return 1;
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) return 0;
+    for (int i = 0; i < 5; ++i) {
+        if (!QueryPerformanceCounter(&before)) continue;
+        if (!gn_bridge_call("GET_TIME", response, sizeof(response))) continue;
+        if (!QueryPerformanceCounter(&after)) continue;
+        long long time = gn_parse_i64(response, "time", 0);
+        if (time <= 0 || before.QuadPart < 0 || after.QuadPart < before.QuadPart) continue;
+        long long elapsed = after.QuadPart - before.QuadPart;
+        if (elapsed < best) {
+            best = elapsed;
+            gn_clock.counter = before.QuadPart + elapsed / 2;
+            gn_clock.time = time;
+            gn_clock.frequency = frequency.QuadPart;
+        }
+    }
+    gn_clock_ready = best != 0x7fffffffffffffffLL;
+    if (gn_clock_ready) gn_log_line("Windows performance counter synchronized with headset OpenXR clock");
+    return gn_clock_ready;
+}
+
+static XrResult gn_convert_clock(XrInstance instance, long long value, long long* out, int to_time) {
+    if (instance != gn_instance) return XR_ERROR_HANDLE_INVALID;
+    if (!out) return XR_ERROR_VALIDATION_FAILURE;
+    if (!gn_clock_enabled) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    if (value <= 0) return XR_ERROR_TIME_INVALID;
+    while (__atomic_exchange_n(&gn_clock_lock, 1, __ATOMIC_ACQUIRE) != 0) {}
+    XrResult result = XR_ERROR_RUNTIME_FAILURE;
+    if (gn_prepare_clock()) {
+        result = gn_xr_clock_convert(&gn_clock, value, to_time, out) ? XR_SUCCESS : XR_ERROR_TIME_INVALID;
+    }
+    __atomic_store_n(&gn_clock_lock, 0, __ATOMIC_RELEASE);
+    return result;
+}
+
+static XrResult XRAPI_CALL gn_xrConvertWin32PerformanceCounterToTimeKHR(
+    XrInstance instance, const GnLargeInteger* performanceCounter, XrTime* time) {
+    if (!performanceCounter || !time) return XR_ERROR_VALIDATION_FAILURE;
+    long long converted;
+    XrResult result = gn_convert_clock(instance, performanceCounter->QuadPart, &converted, 1);
+    if (XR_SUCCEEDED(result)) *time = converted;
+    return result;
+}
+
+static XrResult XRAPI_CALL gn_xrConvertTimeToWin32PerformanceCounterKHR(
+    XrInstance instance, XrTime time, GnLargeInteger* performanceCounter) {
+    if (!performanceCounter) return XR_ERROR_VALIDATION_FAILURE;
+    return gn_convert_clock(instance, time, &performanceCounter->QuadPart, 0);
 }
 
 static XrResult XRAPI_CALL gn_xrCreateInstance(const XrInstanceCreateInfo* createInfo, XrInstance* instance) {
     if (!instance) return XR_ERROR_VALIDATION_FAILURE;
+    gn_clock_ready = 0;
+    gn_clock_enabled = 0;
     gn_clear_events();
     gn_session_running = 0;
     gn_stopping_pushed = 0;
@@ -1654,6 +1727,7 @@ static XrResult XRAPI_CALL gn_xrCreateInstance(const XrInstanceCreateInfo* creat
         gn_log2("xrCreateInstance app=", createInfo->applicationInfo.applicationName);
         for (gn_uint32 i = 0; i < createInfo->enabledExtensionCount; ++i) {
             gn_log2("  enabled extension: ", createInfo->enabledExtensionNames[i]);
+            if (gn_streq(createInfo->enabledExtensionNames[i], GN_WIN32_TIME_EXTENSION)) gn_clock_enabled = 1;
         }
     }
     gn_bridge_call("HELLO", NULL, 0);
@@ -3462,6 +3536,10 @@ GN_EXPORT XrResult XRAPI_CALL xrGetInstanceProcAddr(XrInstance instance, const c
     *function = NULL;
 #define GN_PROC(n) if (gn_streq(name, #n)) { *function = (PFN_xrVoidFunction)gn_##n; return XR_SUCCESS; }
     GN_PROC(xrEnumerateInstanceExtensionProperties)
+    if (gn_clock_enabled && instance == gn_instance) {
+        GN_PROC(xrConvertWin32PerformanceCounterToTimeKHR)
+        GN_PROC(xrConvertTimeToWin32PerformanceCounterKHR)
+    }
     GN_PROC(xrCreateInstance)
     GN_PROC(xrDestroyInstance)
     GN_PROC(xrGetInstanceProperties)

@@ -45,6 +45,8 @@ object XrNative {
         outFlags: BooleanArray,
     ): Boolean
 
+    external fun nativeGetWindowsXrTime(handle: Long): Long
+
     external fun nativeWaitWindowsFrame(
         handle: Long,
         afterSerial: Long,

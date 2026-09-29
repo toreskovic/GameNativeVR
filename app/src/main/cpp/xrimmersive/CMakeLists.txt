@@ -34,6 +34,7 @@ target_link_libraries(xrimmersive
 )
 
 target_compile_definitions(xrimmersive PRIVATE
+    XR_USE_TIMESPEC=1
     XR_USE_PLATFORM_ANDROID=1
     XR_USE_GRAPHICS_API_OPENGL_ES=1
     EGL_EGLEXT_PROTOTYPES=1

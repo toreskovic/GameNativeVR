@@ -11,3 +11,5 @@ EXPORTS
     FreeLibrary
     ExitProcess
     GetTickCount64
+    QueryPerformanceCounter
+    QueryPerformanceFrequency

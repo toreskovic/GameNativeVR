@@ -1,5 +1,6 @@
 #pragma once
 
+#include <time.h>
 #include <jni.h>
 #include <atomic>
 #include <array>
@@ -108,6 +109,7 @@ public:
     void requestStop();
     void join();
 
+    XrTime currentWindowsXrTime() const;
     InputSnapshot pollSnapshot();
     bool waitWindowsRuntimeSnapshot(uint64_t afterSerial, uint32_t timeoutMs,
                                     WindowsRuntimeSnapshot *snapshot);
@@ -304,6 +306,8 @@ private:
     std::thread thread_;
     std::atomic<bool> stopRequested_{false};
 
+    std::atomic<bool> windowsClockReady_{false};
+    int64_t windowsClockOffset_ = 0;
     std::mutex snapshotMutex_;
     InputSnapshot snapshot_;
     std::mutex windowsSnapshotMutex_;

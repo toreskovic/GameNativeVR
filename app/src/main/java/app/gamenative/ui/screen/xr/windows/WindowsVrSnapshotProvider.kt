@@ -49,6 +49,10 @@ class WindowsVrSnapshotProvider {
         return snapshot
     }
 
+    fun currentXrTime(): Long = synchronized(lock) {
+        if (handle == 0L) 0L else XrNative.nativeGetWindowsXrTime(handle)
+    }
+
     fun latest(): WindowsVrRuntimeSnapshot? = latest
 
     fun applyHaptic(hand: Int, amplitude: Float, duration: Long, frequency: Float): Boolean {

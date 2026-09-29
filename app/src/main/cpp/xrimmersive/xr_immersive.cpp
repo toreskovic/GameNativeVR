@@ -330,6 +330,8 @@ bool XrImmersiveSession::setupInstanceAndSession() {
         XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
         XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
     };
+    const bool timeConversionAvailable = IsInstanceExtensionSupported(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
+    if (timeConversionAvailable) extensions.push_back(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
     passthroughExtensionAvailable_ = IsInstanceExtensionSupported(XR_FB_PASSTHROUGH_EXTENSION_NAME);
     if (passthroughExtensionAvailable_) {
         extensions.push_back(XR_FB_PASSTHROUGH_EXTENSION_NAME);
@@ -372,6 +374,24 @@ bool XrImmersiveSession::setupInstanceAndSession() {
     createInfo.enabledExtensionNames = extensions.data();
 
     if (!XrCheck(xrCreateInstance(&createInfo, &instance_), "xrCreateInstance")) return false;
+
+    // Frame timestamps belong to the vendor runtime's epoch, not necessarily Linux uptime.
+    // Establish its fixed offset from CLOCK_MONOTONIC once; GET_TIME then needs no XR calls.
+    if (timeConversionAvailable) {
+        PFN_xrConvertTimespecTimeToTimeKHR convert = nullptr;
+        xrGetInstanceProcAddr(instance_, "xrConvertTimespecTimeToTimeKHR",
+                              reinterpret_cast<PFN_xrVoidFunction *>(&convert));
+        timespec now{};
+        XrTime time = 0;
+        if (convert && clock_gettime(CLOCK_MONOTONIC, &now) == 0 &&
+            XR_SUCCEEDED(convert(instance_, &now, &time))) {
+            windowsClockOffset_ = time - (int64_t(now.tv_sec) * 1000000000LL + now.tv_nsec);
+            windowsClockReady_.store(true, std::memory_order_release);
+            LOGI("Windows VR clock conversion ready");
+        } else {
+            LOGE("Windows VR clock conversion initialization failed");
+        }
+    }
 
     XrSystemGetInfo systemGetInfo{XR_TYPE_SYSTEM_GET_INFO};
     systemGetInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -1582,7 +1602,15 @@ void XrImmersiveSession::syncWindowsTrackingPoses(InputSnapshot *snapshot,
     snapshot->handPosesValid = snapshot->aimPoseValid[0] && snapshot->aimPoseValid[1];
 }
 
+XrTime XrImmersiveSession::currentWindowsXrTime() const {
+    if (!windowsClockReady_.load(std::memory_order_acquire)) return 0;
+    timespec now{};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return int64_t(now.tv_sec) * 1000000000LL + now.tv_nsec + windowsClockOffset_;
+}
+
 void XrImmersiveSession::teardown() {
+    windowsClockReady_.store(false, std::memory_order_release);
     stereoActive_.store(false);
     stereoMisses_ = 0;
     windowsTransport_.stop();

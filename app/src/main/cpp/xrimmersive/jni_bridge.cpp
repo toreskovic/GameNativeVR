@@ -137,6 +137,13 @@ Java_app_gamenative_ui_screen_xr_XrNative_nativePollSnapshot(JNIEnv *env, jclass
     return snapshot.quickMenuClicked ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jlong JNICALL
+Java_app_gamenative_ui_screen_xr_XrNative_nativeGetWindowsXrTime(JNIEnv *, jclass, jlong handlePtr) {
+    std::lock_guard<std::mutex> lock(gHandleMutex);
+    auto *handle = LiveHandle(handlePtr);
+    return handle ? handle->session->currentWindowsXrTime() : 0;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_app_gamenative_ui_screen_xr_XrNative_nativeWaitWindowsFrame(
     JNIEnv *env, jclass, jlong handlePtr, jlong afterSerial, jint timeoutMs,

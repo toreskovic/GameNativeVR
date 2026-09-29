@@ -84,6 +84,10 @@ class WindowsVrControlServer(
         if (tokens.isEmpty()) return "ERROR malformed"
         return when (tokens[0]) {
             "HELLO" -> if (tokens.size == 1) "OK GameNativeVR ${config.protocolVersion}" else "ERROR malformed"
+            "GET_TIME" -> if (tokens.size == 1) {
+                val time = snapshots.currentXrTime()
+                if (time > 0L) "OK time=$time" else "ERROR clock_unavailable"
+            } else "ERROR malformed"
             "GET_SYSTEM" -> if (tokens.size == 1) "OK system=1 vendor=2833 name=Meta_Quest_GameNative" else "ERROR malformed"
             "GET_VIEWS" -> if (tokens.size == 1) getViews() else "ERROR malformed"
             "GET_BOUNDS" -> if (tokens.size == 1) getBounds() else "ERROR malformed"
