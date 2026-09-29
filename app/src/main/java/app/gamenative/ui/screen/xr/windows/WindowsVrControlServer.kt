@@ -197,9 +197,9 @@ class WindowsVrControlServer(
 
     private fun getViews(): String {
         val snapshot = currentSnapshot() ?: return "ERROR unavailable"
-        val scale = config.renderScalePercent.toLong()
-        val scaledWidth = (snapshot.timing[5] * scale / 100) and 1L.inv()
-        val scaledHeight = (snapshot.timing[6] * scale / 100) and 1L.inv()
+        val scale = config.renderScalePercent.toLong() * config.fovScalePercent.coerceIn(70, 100)
+        val scaledWidth = (snapshot.timing[5] * scale / 10_000) and 1L.inv()
+        val scaledHeight = (snapshot.timing[6] * scale / 10_000) and 1L.inv()
         return "OK count=2 width=$scaledWidth height=$scaledHeight"
     }
 
@@ -210,10 +210,22 @@ class WindowsVrControlServer(
 
     private fun locateViews(): String {
         val snapshot = snapshots.latest() ?: return "ERROR unavailable"
+        // Scale tangent-plane extents about their midpoint, preserving eye asymmetry.
+        val views = snapshot.views.copyOf()
+        val fovScale = config.fovScalePercent.coerceIn(70, 100) / 100.0
+        if (fovScale < 1.0) for (eye in 0 until 2) {
+            for ((a, b) in listOf(7 to 8, 9 to 10)) {
+                val first = kotlin.math.tan(views[eye * 11 + a].toDouble())
+                val second = kotlin.math.tan(views[eye * 11 + b].toDouble())
+                val center = (first + second) * 0.5
+                views[eye * 11 + a] = kotlin.math.atan(center + (first - center) * fovScale).toFloat()
+                views[eye * 11 + b] = kotlin.math.atan(center + (second - center) * fovScale).toFloat()
+            }
+        }
         val rawValues = buildList(22) {
             for (eye in 0 until 2) {
                 for (field in 0 until 11) {
-                    add((snapshot.views[eye * 11 + field] * 1_000_000f).toLong())
+                    add((views[eye * 11 + field] * 1_000_000f).toLong())
                 }
             }
         }.joinToString(" ")
@@ -221,7 +233,7 @@ class WindowsVrControlServer(
             for (eye in 0 until 2) {
                 val prefix = if (eye == 0) "l" else "r"
                 for (field in viewFields.indices) {
-                    add("$prefix${viewFields[field]}=${(snapshot.views[eye * 11 + field] * 1_000_000f).toLong()}")
+                    add("$prefix${viewFields[field]}=${(views[eye * 11 + field] * 1_000_000f).toLong()}")
                 }
             }
         }.joinToString(" ")

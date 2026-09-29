@@ -11,6 +11,7 @@ data class WindowsVrRuntimeConfig(
     val runtimeManifest: String = "C:\\gamenative-xr\\active_runtime.json",
     val transportEndpoint: String = "@gamenative-xr",
     val renderScalePercent: Int = 100,
+    val fovScalePercent: Int = 100,
 ) {
     companion object {
         fun from(container: Container): WindowsVrRuntimeConfig {
@@ -18,6 +19,7 @@ data class WindowsVrRuntimeConfig(
                 enabled = container.getExtra("windowsVrEnabled", "false").toBoolean(),
                 openCompositeEnabled = container.getExtra("windowsVrOpenCompositeEnabled", "false").toBoolean(),
                 renderScalePercent = container.xrRenderScale.coerceIn(25, 100),
+                fovScalePercent = container.xrFovScale.coerceIn(70, 100),
             )
         }
     }

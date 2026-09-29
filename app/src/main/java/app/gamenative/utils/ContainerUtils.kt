@@ -310,6 +310,8 @@ object ContainerUtils {
             displayRenderer = container.displayRenderer,
             xrRefreshRate = container.xrRefreshRate,
             xrRenderScale = container.xrRenderScale,
+            xrFovScale = container.xrFovScale,
+            xrFovBorder = container.xrFovBorder,
             xrFoveation = container.xrFoveation,
             xrUpscaler = container.xrUpscaler,
             xrSgsrSharpness = container.xrSgsrSharpness,
@@ -504,6 +506,8 @@ object ContainerUtils {
         container.displayRenderer = containerData.displayRenderer
         container.xrRefreshRate = containerData.xrRefreshRate
         container.xrRenderScale = containerData.xrRenderScale
+        container.xrFovScale = containerData.xrFovScale
+        container.xrFovBorder = containerData.xrFovBorder
         container.xrFoveation = containerData.xrFoveation
         container.xrUpscaler = containerData.xrUpscaler
         container.xrSgsrSharpness = containerData.xrSgsrSharpness

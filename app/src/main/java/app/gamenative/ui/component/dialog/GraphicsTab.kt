@@ -197,6 +197,28 @@ fun GraphicsTabContent(state: ContainerConfigState, default: Boolean = false) {
                     Text(text = stringResource(R.string.xr_render_scale_physical_desc))
                 }
                 if (config.windowsVrEnabled) {
+                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                        Text(stringResource(R.string.xr_fov_scale, config.xrFovScale))
+                        Slider(
+                            value = config.xrFovScale.coerceIn(70, 100).toFloat(),
+                            onValueChange = { value ->
+                                state.config.value = config.copy(xrFovScale = value.roundToInt().coerceIn(70, 100))
+                            },
+                            valueRange = 70f..100f,
+                            steps = 29,
+                        )
+                        Text(stringResource(R.string.xr_fov_scale_desc))
+                    }
+                    SettingsListDropdown(
+                        colors = settingsTileColors(),
+                        title = { Text(stringResource(R.string.xr_fov_border)) },
+                        value = config.xrFovBorder.coerceIn(0, 2),
+                        items = listOf(stringResource(R.string.xr_fov_black),
+                            stringResource(R.string.xr_fov_extend), stringResource(R.string.xr_fov_blurred)),
+                        onItemSelected = { mode -> state.config.value = config.copy(xrFovBorder = mode) },
+                    )
+                    Text(stringResource(R.string.xr_fov_border_desc),
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
                     SettingsListDropdown(
                         colors = settingsTileColors(),
                         title = { Text(stringResource(R.string.xr_ffr_title)) },

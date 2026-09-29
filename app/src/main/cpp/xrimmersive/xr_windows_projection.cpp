@@ -1,4 +1,5 @@
 #include "xr_windows_projection.h"
+#include "xr_fov.h"
 
 #include <EGL/eglext.h>
 #include <GLES2/gl2ext.h>
@@ -51,18 +52,23 @@ GLuint compileShader(GLenum type, const char *source) {
 }
 
 bool WindowsProjectionPresenter::initialize(XrSession session, int64_t format, uint32_t width,
-                                            uint32_t height, EGLDisplay display, int upscaler, float sgsrSharpness) {
+                                            uint32_t height, EGLDisplay display, int upscaler, float sgsrSharpness, float fovScale, int fovBorder) {
     session_ = session;
-    width_ = width;
-    height_ = height;
+    fovScale_ = std::isfinite(fovScale) ? std::clamp(fovScale, 0.7f, 1.0f) : 1.0f;
+    fovBorder_ = std::clamp(fovBorder, 0, 2);
+    sceneWidth_ = fovScale_ < 1.0f ? scaledFovDimension(width, fovScale_) : width;
+    sceneHeight_ = fovScale_ < 1.0f ? scaledFovDimension(height, fovScale_) : height;
+    // Black needs no fill pass: submit the narrower FOV to the compositor.
+    width_ = fovBorder_ == 0 ? sceneWidth_ : width;
+    height_ = fovBorder_ == 0 ? sceneHeight_ : height;
     display_ = display;
     for (auto &eye : eglImages_) eye.fill(EGL_NO_IMAGE_KHR);
     XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
     info.format = format;
     info.sampleCount = 1;
-    info.width = width;
-    info.height = height;
+    info.width = width_;
+    info.height = height_;
     info.faceCount = 1;
     info.arraySize = 2;
     info.mipCount = 1;
@@ -75,6 +81,24 @@ bool WindowsProjectionPresenter::initialize(XrSession session, int64_t format, u
             reinterpret_cast<XrSwapchainImageBaseHeader *>(images_.data())))) return false;
     glGenFramebuffers(1, &framebuffer_);
     if (!ensureProgram()) return false;
+    if (fovScale_ < 1.0f && fovBorder_ != 0) {
+        glGenTextures(1, &sceneTexture_);
+        glBindTexture(GL_TEXTURE_2D, sceneTexture_);
+        // Match swapchain encoding; sampling decodes sRGB before the final write.
+        glTexStorage2D(GL_TEXTURE_2D, 1, static_cast<GLenum>(format), sceneWidth_, sceneHeight_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenFramebuffers(1, &sceneFramebuffer_);
+        glBindFramebuffer(GL_FRAMEBUFFER, sceneFramebuffer_);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sceneTexture_, 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    LOGI("VR FOV scale=%.2f border=%d scene=%ux%u output=%ux%u", fovScale_, fovBorder_,
+         sceneWidth_, sceneHeight_, width_, height_);
     if (upscaler == 2 || upscaler == 3) sgsr_.initialize(upscaler == 3, sgsrSharpness);
     return true;
 }
@@ -93,6 +117,23 @@ bool WindowsProjectionPresenter::ensureProgram() {
     glAttachShader(program_, vertex);
     glAttachShader(program_, fragment);
     glLinkProgram(program_);
+    if (fovScale_ < 1.0f && fovBorder_ != 0) {
+        const GLuint border = compileShader(GL_FRAGMENT_SHADER, kFovBorderFragment);
+        if (!border) { glDeleteShader(vertex); glDeleteShader(fragment); return false; }
+        borderProgram_ = glCreateProgram();
+        glAttachShader(borderProgram_, vertex);
+        glAttachShader(borderProgram_, border);
+        glLinkProgram(borderProgram_);
+        glDeleteShader(border);
+        GLint ok = GL_FALSE;
+        glGetProgramiv(borderProgram_, GL_LINK_STATUS, &ok);
+        if (!ok) { glDeleteShader(vertex); glDeleteShader(fragment); return false; }
+        glUseProgram(borderProgram_);
+        glUniform1i(glGetUniformLocation(borderProgram_, "s"), 0);
+        glUniform1f(glGetUniformLocation(borderProgram_, "fovScale"), fovScale_);
+        glUniform1i(glGetUniformLocation(borderProgram_, "borderMode"), fovBorder_);
+        glUniform4f(glGetUniformLocation(borderProgram_, "u"), 0, 0, 1, 1);
+    }
     glDeleteShader(vertex);
     glDeleteShader(fragment);
     GLint linked = GL_FALSE;
@@ -368,8 +409,10 @@ bool WindowsProjectionPresenter::importEyeBuffer(WindowsFrameTransport &transpor
 
 void WindowsProjectionPresenter::drawEye(uint32_t eye, const EyeFrame &source,
                                          uint32_t imageIndex) {
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_);
     glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, images_[imageIndex].image, 0, eye);
-    glViewport(0, 0, static_cast<GLsizei>(width_), static_cast<GLsizei>(height_));
+    if (sceneFramebuffer_) glBindFramebuffer(GL_FRAMEBUFFER, sceneFramebuffer_);
+    glViewport(0, 0, static_cast<GLsizei>(sceneWidth_), static_cast<GLsizei>(sceneHeight_));
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, textures_[eye][source.imageIndex]);
     const float sourceWidth = source.sourceWidth > 0 ? source.sourceWidth : source.width;
@@ -377,16 +420,23 @@ void WindowsProjectionPresenter::drawEye(uint32_t eye, const EyeFrame &source,
     const float v0 = (source.flipY ? source.sourceY + sourceHeight : source.sourceY) /
                      static_cast<float>(source.height);
     const float vScale = (source.flipY ? -sourceHeight : sourceHeight) / source.height;
-    if (sgsr_.ready() && sourceWidth <= width_ && sourceHeight <= height_ &&
-        (sourceWidth < width_ || sourceHeight < height_)) {
+    if (sgsr_.ready() && sourceWidth <= sceneWidth_ && sourceHeight <= sceneHeight_ &&
+        (sourceWidth < sceneWidth_ || sourceHeight < sceneHeight_)) {
         sgsr_.draw(source.width, source.height, source.sourceX, source.sourceY,
                    sourceWidth, sourceHeight, source.flipY);
-        return;
+    } else {
+        glUseProgram(program_);
+        glUniform4f(uvTransformLocation_, source.sourceX / static_cast<float>(source.width), v0,
+                    sourceWidth / source.width, vScale);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     }
-    glUseProgram(program_);
-    glUniform4f(uvTransformLocation_, source.sourceX / static_cast<float>(source.width), v0,
-                sourceWidth / source.width, vScale);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    if (sceneFramebuffer_) {
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_);
+        glViewport(0, 0, width_, height_);
+        glBindTexture(GL_TEXTURE_2D, sceneTexture_);
+        glUseProgram(borderProgram_);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
 }
 
 void WindowsProjectionPresenter::discardFresh(WindowsFrameTransport &transport,
@@ -445,6 +495,12 @@ bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpac
                 frames[eye].projectionFov[0], frames[eye].projectionFov[1],
                 frames[eye].projectionFov[2], frames[eye].projectionFov[3]};
         }
+        if (sceneFramebuffer_ && frames[eye].projectionValid) {
+            // Invert the same centered tangent-space crop exposed by GET_VIEWS /
+            // LOCATE_VIEWS. Use the submitted frame's FOV, never a newer pose/FOV.
+            scaleFovPair(view.fov.angleLeft, view.fov.angleRight, 1.0f / fovScale_);
+            scaleFovPair(view.fov.angleUp, view.fov.angleDown, 1.0f / fovScale_);
+        }
         view.subImage.swapchain = swapchain_;
         view.subImage.imageRect = {{0, 0}, {static_cast<int32_t>(width_), static_cast<int32_t>(height_)}};
         view.subImage.imageArrayIndex = eye;
@@ -485,6 +541,10 @@ bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpac
 }
 
 void WindowsProjectionPresenter::shutdown() {
+    if (sceneFramebuffer_) glDeleteFramebuffers(1, &sceneFramebuffer_);
+    if (sceneTexture_) glDeleteTextures(1, &sceneTexture_);
+    if (borderProgram_) glDeleteProgram(borderProgram_);
+    sceneFramebuffer_ = sceneTexture_ = borderProgram_ = 0;
     sgsr_.shutdown();
     if (acquireSync_ != EGL_NO_SYNC_KHR) {
         eglDestroySyncKHR(display_, acquireSync_);

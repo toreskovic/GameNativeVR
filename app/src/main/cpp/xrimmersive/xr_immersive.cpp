@@ -137,7 +137,7 @@ void XrImmersiveSession::submitFrame(const uint8_t *rgbaPixels, int32_t width, i
 }
 
 void XrImmersiveSession::configure(int32_t quadWidth, int32_t quadHeight, float refreshRate, int upscaler,
-                                     int32_t eyeWidth, int32_t eyeHeight, float sgsrSharpness) {
+                                     int32_t eyeWidth, int32_t eyeHeight, float sgsrSharpness, float fovScale, int fovBorder) {
     if (quadWidth > 0 && quadHeight > 0) {
         swapchainWidth_ = quadWidth;
         swapchainHeight_ = quadHeight;
@@ -145,6 +145,8 @@ void XrImmersiveSession::configure(int32_t quadWidth, int32_t quadHeight, float 
     if (refreshRate > 0.0f) requestedRefreshRate_ = refreshRate;
     upscaler_ = upscaler;
     sgsrSharpness_ = sgsrSharpness;
+    fovScale_ = fovScale;
+    fovBorder_ = fovBorder;
     physicalEyeWidth_ = eyeWidth;
     physicalEyeHeight_ = eyeHeight;
 }
@@ -668,7 +670,7 @@ bool XrImmersiveSession::setupInstanceAndSession() {
         }
         windowsProjectionReady_ = windowsProjection_.initialize(
             session_, chosenFormat,
-            eyeWidth, eyeHeight, eglDisplay_, upscaler_, sgsrSharpness_);
+            eyeWidth, eyeHeight, eglDisplay_, upscaler_, sgsrSharpness_, fovScale_, fovBorder_);
     }
         windowsTransport_.start("@gamenative-xr");
 
@@ -1173,14 +1175,16 @@ bool XrImmersiveSession::submitWindowsProjection(XrTime predictedDisplayTime) {
     passthroughLayer.layerHandle = passthroughLayer_;
     std::array<const XrCompositionLayerBaseHeader *, 3> layers{};
     uint32_t layerCount = 0;
-    if (passthroughActive_ && passthroughLayer_ != XR_NULL_HANDLE) {
+    // A cropped Black border must stay black even if the flat-screen UI had passthrough enabled.
+    const bool projectionPassthrough = passthroughActive_ && !(fovScale_ < 1.0f && fovBorder_ == 0);
+    if (projectionPassthrough && passthroughLayer_ != XR_NULL_HANDLE) {
         layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&passthroughLayer);
     }
     layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection);
     if (overlayRendered) layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&overlay);
     XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
     endInfo.displayTime = predictedDisplayTime;
-    endInfo.environmentBlendMode = passthroughActive_ ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+    endInfo.environmentBlendMode = projectionPassthrough ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
                                                        : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     endInfo.layerCount = layerCount;
     endInfo.layers = layers.data();

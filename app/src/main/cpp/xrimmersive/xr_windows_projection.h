@@ -18,7 +18,7 @@ namespace xrimmersive::windowsvr {
 
 class WindowsProjectionPresenter {
 public:
-    bool initialize(XrSession session, int64_t format, uint32_t width, uint32_t height, EGLDisplay display, int upscaler, float sgsrSharpness);
+    bool initialize(XrSession session, int64_t format, uint32_t width, uint32_t height, EGLDisplay display, int upscaler, float sgsrSharpness, float fovScale, int fovBorder);
     bool render(WindowsFrameTransport &transport, XrSpace space, XrCompositionLayerProjection *layer);
     void shutdown();
 
@@ -54,6 +54,10 @@ private:
     std::array<uint64_t, 2> renderedSerials_{0, 0};
     EGLSyncKHR acquireSync_ = EGL_NO_SYNC_KHR;
     SgsrUpscaler sgsr_;
+    float fovScale_ = 1.0f;
+    int fovBorder_ = 0;
+    uint32_t sceneWidth_ = 0, sceneHeight_ = 0;
+    GLuint sceneTexture_ = 0, sceneFramebuffer_ = 0, borderProgram_ = 0;
     GLuint framebuffer_ = 0;
     GLuint program_ = 0;
     GLuint vertexBuffer_ = 0;

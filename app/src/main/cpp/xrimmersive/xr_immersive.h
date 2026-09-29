@@ -104,7 +104,7 @@ struct WindowsRuntimeSnapshot {
 class XrImmersiveSession {
 public:
     void configure(int32_t quadWidth, int32_t quadHeight, float refreshRate, int upscaler,
-                                     int32_t eyeWidth, int32_t eyeHeight, float sgsrSharpness);
+                                     int32_t eyeWidth, int32_t eyeHeight, float sgsrSharpness, float fovScale, int fovBorder);
     bool initialize(JavaVM *vm, jobject activityRef);
     void requestStop();
     void join();
@@ -198,6 +198,8 @@ private:
     float requestedRefreshRate_ = 72.0f;
     int upscaler_ = 0;
     float sgsrSharpness_ = 0.7f;
+    float fovScale_ = 1.0f;
+    int fovBorder_ = 0;
     int32_t physicalEyeWidth_ = 0;
     int32_t physicalEyeHeight_ = 0;
 

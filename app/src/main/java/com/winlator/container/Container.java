@@ -88,6 +88,8 @@ public class Container {
     private String displayRenderer = Container.DEFAULT_DISPLAY_RENDERER;
     private int xrRefreshRate = 72;
     private int xrRenderScale = 100;
+    private int xrFovScale = 100;
+    private int xrFovBorder = 0; // Black, Extend, Blurred
     private int xrFoveation = 1; // Off, Conservative (default), Aggressive
     // Stable saved IDs: 0 = bilinear, 1 = retired FSR, 2 = SGSR, 3 = SGSR edge direction.
     private int xrUpscaler = 2; // SGSR 1
@@ -287,6 +289,11 @@ public class Container {
     public void setRendererPresentMode(String v) { this.rendererPresentMode = v != null ? v : "fifo"; }
 
     public String getDisplayRenderer() { return displayRenderer; }
+
+    public int getXrFovScale() { return xrFovScale; }
+    public void setXrFovScale(int value) { xrFovScale = Math.max(70, Math.min(100, value)); }
+    public int getXrFovBorder() { return xrFovBorder; }
+    public void setXrFovBorder(int value) { xrFovBorder = Math.max(0, Math.min(2, value)); }
 
     public int getXrRefreshRate() { return xrRefreshRate; }
 
@@ -763,6 +770,8 @@ public class Container {
             data.put("displayRendererMode", displayRenderer);
             data.put("xrRefreshRate", xrRefreshRate);
             data.put("xrRenderScale", xrRenderScale);
+            data.put("xrFovScale", xrFovScale);
+            data.put("xrFovBorder", xrFovBorder);
             data.put("xrFoveation", xrFoveation);
             data.put("xrUpscaler", xrUpscaler);
             data.put("xrSgsrSharpness", xrSgsrSharpness);
@@ -894,6 +903,12 @@ public class Container {
                     break;
                 case "displayRendererMode" :
                     setDisplayRenderer(data.getString(key));
+                    break;
+                case "xrFovScale" :
+                    setXrFovScale(data.getInt(key));
+                    break;
+                case "xrFovBorder" :
+                    setXrFovBorder(data.getInt(key));
                     break;
                 case "xrRefreshRate" :
                     setXrRefreshRate(data.getInt(key));

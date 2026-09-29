@@ -542,6 +542,8 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
         var refreshRate = 72f
         var upscaler = 0
         var sgsrSharpness = 0.7f
+        var fovScale = 1f
+        var fovBorder = 0
         currentAppId?.let { appId ->
             runCatching { app.gamenative.utils.ContainerUtils.getContainer(this, appId) }.getOrNull()?.let { container ->
                 val parts = container.screenSize.split("x")
@@ -553,6 +555,8 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
                 }
                 refreshRate = container.xrRefreshRate.toFloat()
                 sgsrSharpness = container.xrSgsrSharpness / 100f
+                fovScale = container.xrFovScale / 100f
+                fovBorder = container.xrFovBorder
                 upscaler = if (container.xrRenderScale < 100) container.xrUpscaler else 0
             }
         }
@@ -562,7 +566,7 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
         }
         val (eyeWidth, eyeHeight) = physicalEyeResolution()
         xrSessionHandle = try {
-            XrNative.nativeCreate(this, quadW, quadH, refreshRate, upscaler, eyeWidth, eyeHeight, sgsrSharpness)
+            XrNative.nativeCreate(this, quadW, quadH, refreshRate, upscaler, eyeWidth, eyeHeight, sgsrSharpness, fovScale, fovBorder)
         } catch (t: Throwable) {
             Timber.w(t, "Native OpenXR module unavailable — immersive rendering/controller mapping disabled")
             return

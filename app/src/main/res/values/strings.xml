@@ -2635,4 +2635,11 @@
     <string name="xr_ffr_conservative">Conservative</string>
     <string name="xr_ffr_aggressive">Aggressive</string>
     <string name="xr_ffr_desc">Reduces peripheral detail in detected VR scene passes. Conservative requires an eye-image connection; Aggressive also guesses matching scene targets. Requires a compatible Vulkan driver and restarting the game. May cause visual artifacts.</string>
+    <string name="xr_fov_scale">VR FOV Scale: %1$d%%</string>
+    <string name="xr_fov_scale_desc">Render a narrower view with proportionally fewer pixels, preserving object size. Independent of VR Render Scale. Default: 100%. Restart the game to apply.</string>
+    <string name="xr_fov_border">VR FOV Border</string>
+    <string name="xr_fov_black">Black</string>
+    <string name="xr_fov_extend">Extend</string>
+    <string name="xr_fov_blurred">Blurred</string>
+    <string name="xr_fov_border_desc">Below 100% FOV, leave the border black or fill it using edge colors. Blurred softens the fill; neither fill restores missing scenery. Restart the game to apply.</string>
 </resources>
