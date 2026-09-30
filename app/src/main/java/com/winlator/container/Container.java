@@ -191,6 +191,8 @@ public class Container {
 
     private String containerVariant = DEFAULT_VARIANT;
 
+    private String basePrefix = "";
+
     public String getGraphicsDriverVersion() {
         return graphicsDriverVersion;
     }
@@ -612,6 +614,18 @@ public class Container {
         return this.containerVariant;
     }
 
+    public String getBasePrefix() {
+        return basePrefix != null ? basePrefix : "";
+    }
+
+    public void setBasePrefix(String basePrefix) {
+        this.basePrefix = basePrefix != null ? basePrefix : "";
+    }
+
+    public boolean isOverlay() {
+        return ContainerOverlay.isEligible(this) && !getBasePrefix().isEmpty();
+    }
+
     public String getExtra(String name) {
         return getExtra(name, "");
     }
@@ -853,6 +867,7 @@ public class Container {
             data.put("steamType", steamType);
             data.put("language", language);
             data.put("containerVariant", containerVariant);
+            if (!getBasePrefix().isEmpty()) data.put("basePrefix", basePrefix);
             data.put("emulator", emulator);
             data.put("fexcoreVersion", fexcoreVersion);
 
@@ -1143,6 +1158,9 @@ public class Container {
                     break;
                 case "portraitMode":
                     this.portraitMode = data.getBoolean(key);
+                    break;
+                case "basePrefix":
+                    setBasePrefix(data.optString(key, ""));
                     break;
             }
         }

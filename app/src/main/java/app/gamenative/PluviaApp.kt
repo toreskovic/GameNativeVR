@@ -162,6 +162,7 @@ class PluviaApp : SplitCompatApplication() {
 
         Thread {
             PowerManager.initialize(this)
+            DeviceInfo.registerPowerSuperProperties()
         }.start()
     }
 
