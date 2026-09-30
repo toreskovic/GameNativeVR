@@ -51,7 +51,7 @@ object ContainerUtils {
     fun setContainerDefaults(context: Context) {
         DefaultVersion.VARIANT = Container.BIONIC
         DefaultVersion.WINE_VERSION = "proton-11.0-1-arm64ec-1"
-        DefaultVersion.DEFAULT_GRAPHICS_DRIVER = "Wrapper-gamenative"
+        DefaultVersion.DEFAULT_GRAPHICS_DRIVER = "wrapper-gamenative"
         DefaultVersion.DXVK = "2.7.1-1-gplasync-0"
         DefaultVersion.VKD3D = "2.14.1"
         DefaultVersion.WRAPPER = WRAPPER_PICO_A10
@@ -950,7 +950,7 @@ object ContainerUtils {
             dxvkConfig.put("version", DefaultVersion.DXVK)
             containerData = containerData.copy(
                 wineVersion = DefaultVersion.WINE_VERSION,
-                graphicsDriver = "Wrapper-gamenative",
+                graphicsDriver = "wrapper-gamenative",
                 graphicsDriverConfig = kvs.toString(),
                 dxwrapper = "dxvk",
                 dxwrapperConfig = dxvkConfig.toString(),

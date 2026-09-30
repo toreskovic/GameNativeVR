@@ -665,7 +665,7 @@ fun ContainerConfigDialog(
 
         // Bionic-specific state
         val bionicDriverIndexRef = rememberSaveable {
-            val idx = bionicGraphicsDriversMerged.indexOfFirst { StringUtils.parseIdentifier(it) == config.graphicsDriver }
+            val idx = bionicGraphicsDriversMerged.indexOfFirst { StringUtils.parseIdentifier(it) == StringUtils.parseIdentifier(config.graphicsDriver) }
             mutableIntStateOf(if (idx >= 0) idx else 0)
         }
         var bionicDriverIndex by bionicDriverIndexRef
@@ -751,7 +751,7 @@ fun ContainerConfigDialog(
         }
 
         LaunchedEffect(bionicGraphicsDriversMerged, config.graphicsDriver) {
-            val newIdx = bionicGraphicsDriversMerged.indexOfFirst { StringUtils.parseIdentifier(it) == config.graphicsDriver }
+            val newIdx = bionicGraphicsDriversMerged.indexOfFirst { StringUtils.parseIdentifier(it) == StringUtils.parseIdentifier(config.graphicsDriver) }
             if (newIdx >= 0 && bionicDriverIndex != newIdx) bionicDriverIndex = newIdx
         }
 
@@ -775,7 +775,7 @@ fun ContainerConfigDialog(
         }
         var customScreenHeight by customScreenHeightRef
         val graphicsDriverIndexRef = rememberSaveable {
-            val driverIndex = graphicsDrivers.indexOfFirst { StringUtils.parseIdentifier(it) == config.graphicsDriver }
+            val driverIndex = graphicsDrivers.indexOfFirst { StringUtils.parseIdentifier(it) == StringUtils.parseIdentifier(config.graphicsDriver) }
             mutableIntStateOf(if (driverIndex >= 0) driverIndex else 0)
         }
         var graphicsDriverIndex by graphicsDriverIndexRef
