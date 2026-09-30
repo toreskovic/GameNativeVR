@@ -37,19 +37,15 @@ for lib in ws2_32 kernel32 ntdll dxgi; do
     "$bin/llvm-dlltool" -m i386 -k -d "$source_dir/${lib}_x86.def" -l "$work/lib${lib}_x86.a"
 done
 
-# The two OpenXR runtime DLLs (CRT-less PE, built with the NDK's clang).
-"$bin/clang" --target=x86_64-w64-windows-gnu -shared -nostdlib -Wl,-e,DllMain -I "$work/inc" \
+# Release optimization; freestanding keeps our CRT-less memory helpers from recursing.
+"$bin/clang" --target=x86_64-w64-windows-gnu -shared -nostdlib -ffreestanding -O2 -Wl,-e,DllMain -I "$work/inc" \
     -o "$output/gamenative_openxr_runtime64.dll" \
     "$source_dir/gamenative_openxr_runtime.c" "$source_dir/gamenative_openxr_runtime_x64.def" \
     "$work/libws2_32_x64.a" "$work/libkernel32_x64.a" "$work/libntdll_x64.a" "$work/libdxgi_x64.a"
-"$bin/clang" --target=i686-w64-windows-gnu -shared -nostdlib -Wl,-e,DllMain -I "$work/inc" \
+"$bin/clang" --target=i686-w64-windows-gnu -shared -nostdlib -ffreestanding -O2 -Wl,-e,DllMain -I "$work/inc" \
     -o "$output/gamenative_openxr_runtime32.dll" \
     "$source_dir/gamenative_openxr_runtime.c" "$source_dir/gamenative_openxr_runtime_x86.def" \
     "$work/libws2_32_x86.a" "$work/libkernel32_x86.a" "$work/libntdll_x86.a" "$work/libdxgi_x86.a"
-hash64=$(shasum -a 256 "$output/gamenative_openxr_runtime64.dll" | cut -d' ' -f1)
-hash32=$(shasum -a 256 "$output/gamenative_openxr_runtime32.dll" | cut -d' ' -f1)
-printf "3 %s %s" "$hash64" "$hash32" > "$output/payload.version"
-
 # The native immersive compositor (libxrimmersive.so) against the Khronos loader prefab.
 aar=$(find "${GRADLE_USER_HOME:-$HOME/.gradle}/caches/modules-2/files-2.1/org.khronos.openxr/openxr_loader_for_android/1.1.61" -name "*.aar" 2>/dev/null | head -1)
 [ -n "$aar" ] || { echo "OpenXR Android loader 1.1.61 is not in the Gradle cache; run a gradle sync first"; exit 1; }
@@ -99,6 +95,20 @@ cd /repo && bash tools/provision-build-arm64x-wine-bridge.sh /repo'
 elif [ ! -f "$output/gamenative_xr_unixbridge.dll" ]; then
     echo "note: arm64x bridge DLL not present — run with --bridge to build it (Docker)"
 fi
+
+# Hash the complete payload only after every component has been staged.
+payload_files=(gamenative_openxr_runtime64.dll gamenative_openxr_runtime32.dll
+    gamenative_xr_unixbridge.dll gamenative_xr_unixbridge32.dll
+    gamenative_xr_unixbridge.so opencomposite_x64.dll)
+for file in "${payload_files[@]}"; do
+    [ -f "$output/$file" ] || { echo "Missing XR payload file: $file"; exit 1; }
+done
+{
+    printf 'schema 4\n'
+    for file in "${payload_files[@]}"; do
+        printf '%s %s\n' "$file" "$(shasum -a 256 "$output/$file" | cut -d' ' -f1)"
+    done
+} > "$output/payload.version"
 
 # legacyXr ships the same payload.
 mkdir -p "$repository/app/src/legacyXr/assets"
