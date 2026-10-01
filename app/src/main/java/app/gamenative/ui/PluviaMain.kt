@@ -2125,16 +2125,11 @@ fun preLaunchApp(
                 ).await()
             }
 
-            if (!container.isUseLegacyDRM && !container.isLaunchRealSteam &&
-                !SteamService.isFileInstallable(context, "experimental-drm-20260116.tzst")
+            if (gameSource == GameSource.STEAM && !container.isUseLegacyDRM &&
+                !container.isLaunchRealSteam && !container.isLaunchBionicSteam
             ) {
-                setLoadingMessage("Downloading extras")
-                SteamService.downloadFile(
-                    onDownloadProgress = { setLoadingProgress(it / 1.0f) },
-                    this,
-                    context = context,
-                    "experimental-drm-20260116.tzst",
-                ).await()
+                setLoadingMessage("Preparing Steam compatibility")
+                app.gamenative.utils.GbeSteamClient.prepare(context) { setLoadingProgress(it) }
             }
             if (gameSource == GameSource.STEAM && container.isLaunchRealSteam && !isOffline && !container.isSteamOfflineMode &&
                 SteamService.getInstalledApp(gameId) != null

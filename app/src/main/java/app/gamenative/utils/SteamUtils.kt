@@ -373,29 +373,16 @@ object SteamUtils {
         val container = ContainerUtils.getContainer(context, appId)
         val steamRootDir = File(container.getRootDir(), ".wine/drive_c/Program Files (x86)/Steam")
 
-        if (MarkerUtils.hasMarker(appDirPath, Marker.STEAM_COLDCLIENT_USED) && File(container.getRootDir(), ".wine/drive_c/Program Files (x86)/Steam/steamclient_loader_x64.exe").exists()) {
-            return
-        }
+        val alreadyReplaced = MarkerUtils.hasMarker(appDirPath, Marker.STEAM_COLDCLIENT_USED)
+        if (alreadyReplaced && GbeSteamClient.isInstalled(steamRootDir)) return
+
+        // Download and validate before changing container files or markers.
+        val source = GbeSteamClient.prepare(context)
+        if (!alreadyReplaced) backupSteamclientFiles(context, steamAppId)
+        GbeSteamClient.install(source, steamRootDir)
         MarkerUtils.removeMarker(appDirPath, Marker.STEAM_DLL_REPLACED)
         MarkerUtils.removeMarker(appDirPath, Marker.STEAM_DLL_RESTORED)
 
-        // Make a backup before extracting
-        backupSteamclientFiles(context, steamAppId)
-
-        // Delete extra_dlls folder before extraction to prevent conflicts
-        val extraDllDir = File(container.getRootDir(), ".wine/drive_c/Program Files (x86)/Steam/extra_dlls")
-        if (extraDllDir.exists()) {
-            extraDllDir.deleteRecursively()
-            Timber.i("Deleted extra_dlls directory before extraction for appId: $steamAppId")
-        }
-
-        val imageFs = ImageFs.find(context)
-        val downloaded = File(imageFs.getFilesDir(), "experimental-drm-20260116.tzst")
-        TarCompressorUtils.extract(
-            TarCompressorUtils.Type.ZSTD,
-            downloaded,
-            imageFs.getRootDir(),
-        )
         putBackSteamDlls(appDirPath)
         restoreUnpackedExecutable(context, steamAppId)
 
@@ -432,8 +419,8 @@ object SteamUtils {
 
         steamClientFiles().forEach { file ->
             val dll = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/$file")
-            if (dll.exists()) {
-                Files.copy(dll.toPath(), File(backupDir, "$file.orig").toPath(), StandardCopyOption.REPLACE_EXISTING)
+            if (dll.exists() && !File(backupDir, "$file.orig").exists()) {
+                Files.copy(dll.toPath(), File(backupDir, "$file.orig").toPath())
                 backupCount++
             }
         }
@@ -447,6 +434,7 @@ object SteamUtils {
         var restoredCount = 0
 
         val origDir = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam")
+        GbeSteamClient.invalidate(origDir)
 
         val backupDir = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/steamclient_backup")
         if (backupDir.exists()) {
