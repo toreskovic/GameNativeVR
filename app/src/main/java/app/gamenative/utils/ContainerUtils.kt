@@ -958,6 +958,7 @@ object ContainerUtils {
             val kvs = KeyValueSet(containerData.graphicsDriverConfig)
             kvs.put("version", WRAPPER_PICO_A10)
             kvs.put("adrenotoolsTurnip", "1")
+            kvs.put("transcoder", "gpu")
             val dxvkConfig = KeyValueSet(containerData.dxwrapperConfig)
             dxvkConfig.put("version", DefaultVersion.DXVK)
             containerData = containerData.copy(
