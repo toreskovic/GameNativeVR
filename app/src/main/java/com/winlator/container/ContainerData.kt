@@ -65,7 +65,7 @@ data class ContainerData(
     val fexcoreX87Mode: String = "Fast",
     val fexcoreMultiBlock: String = "Disabled",
     // FEXCore preset (arm64ec)
-    val fexcorePreset: String = FEXCorePreset.PERFORMANCE,
+    val fexcorePreset: String = FEXCorePreset.COMPATIBILITY,
     // wine registry
     val renderer: String = "gl",
     val csmt: Boolean = true,
@@ -263,7 +263,7 @@ data class ContainerData(
                     fexcoreTSOMode = (savedMap["fexcoreTSOMode"] as? String) ?: "Fast",
                     fexcoreX87Mode = (savedMap["fexcoreX87Mode"] as? String) ?: "Fast",
                     fexcoreMultiBlock = (savedMap["fexcoreMultiBlock"] as? String) ?: "Disabled",
-                    fexcorePreset = (savedMap["fexcorePreset"] as? String) ?: FEXCorePreset.INTERMEDIATE,
+                    fexcorePreset = (savedMap["fexcorePreset"] as? String) ?: FEXCorePreset.COMPATIBILITY,
                     sdlControllerAPI = savedMap["sdlControllerAPI"] as Boolean,
                     fasterExternalLoading = (savedMap["fasterExternalLoading"] as? Boolean) ?: false,
                     disableLibredirect = (savedMap["disableLibredirect"] as? Boolean) ?: false,

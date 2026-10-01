@@ -178,7 +178,7 @@ fun GeneralTabContent(
                             put("disablePresentWait", get("disablePresentWait").ifEmpty { "0" })
                             if (get("presentMode").isEmpty()) put("presentMode", "mailbox")
                             if (get("resourceType").isEmpty()) put("resourceType", "auto")
-                            if (get("bcnEmulation").isEmpty()) put("bcnEmulation", "auto")
+                            if (get("bcnEmulation").isEmpty()) put("bcnEmulation", "none")
                             if (get("bcnEmulationType").isEmpty()) put("bcnEmulationType", "compute")
                             if (get("bcnEmulationCache").isEmpty()) put("bcnEmulationCache", "0")
                             put("adrenotoolsTurnip", "1")
@@ -214,7 +214,7 @@ fun GeneralTabContent(
                             if (get("maxDeviceMemory").isEmpty()) put("maxDeviceMemory", "4096")
                             if (get("presentMode").isEmpty()) put("presentMode", "mailbox")
                             if (get("resourceType").isEmpty()) put("resourceType", "auto")
-                            if (get("bcnEmulation").isEmpty()) put("bcnEmulation", "auto")
+                            if (get("bcnEmulation").isEmpty()) put("bcnEmulation", "none")
                             if (get("bcnEmulationType").isEmpty()) put("bcnEmulationType", "compute")
                             if (get("bcnEmulationCache").isEmpty()) put("bcnEmulationCache", "0")
                         }

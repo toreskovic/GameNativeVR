@@ -67,7 +67,7 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
     private WineInfo wineInfo;
     private String box64Version = DefaultVersion.BOX64;
     private String box64Preset = Box86_64Preset.COMPATIBILITY;
-    private String fexcorePreset = FEXCorePreset.INTERMEDIATE;
+    private String fexcorePreset = FEXCorePreset.COMPATIBILITY;
     private Callback<Integer> terminationCallback;
     private static final Object lock = new Object();
     private boolean wow64Mode = true;

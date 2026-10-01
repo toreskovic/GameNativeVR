@@ -720,8 +720,8 @@ fun ContainerConfigDialog(
             resourceTypeIndex =
                 resourceTypes.indexOfFirst { it.equals(resourceType, true) }.let { if (it >= 0) it else defaultResourceIdx }
 
-            val bcnMode = cfg.get("bcnEmulation", "auto")
-            val defaultBcnIdx = bcnEmulationEntries.indexOfFirst { it.equals("auto", true) }.takeIf { it >= 0 } ?: 0
+            val bcnMode = cfg.get("bcnEmulation", "none")
+            val defaultBcnIdx = bcnEmulationEntries.indexOfFirst { it.equals("none", true) }.takeIf { it >= 0 } ?: 0
             bcnEmulationIndex =
                 bcnEmulationEntries.indexOfFirst { it.equals(bcnMode, true) }.let { if (it >= 0) it else defaultBcnIdx }
 

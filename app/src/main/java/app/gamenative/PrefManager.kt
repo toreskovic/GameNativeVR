@@ -684,7 +684,7 @@ object PrefManager {
 
     private val FEXCORE_PRESET = stringPreferencesKey("fexcore_preset")
     var fexcorePreset: String
-        get() = getPref(FEXCORE_PRESET, com.winlator.fexcore.FEXCorePreset.PERFORMANCE)
+        get() = getPref(FEXCORE_PRESET, com.winlator.fexcore.FEXCorePreset.COMPATIBILITY)
         set(value) {
             setPref(FEXCORE_PRESET, value)
         }
