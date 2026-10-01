@@ -90,6 +90,7 @@
         <item>SurfaceFlinger</item>
     </string-array>
     <string-array name="dxvk_version_entries">
+        <item>3.1.1-gamenativevr-1</item>
         <item>async-1.10.3</item>
         <item>2.7.1</item>
         <item>1.10.3</item>

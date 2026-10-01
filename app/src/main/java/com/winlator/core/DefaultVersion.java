@@ -14,7 +14,7 @@ public abstract class DefaultVersion {
     public static final String TURNIP = "25.2.0";
     public static final String ZINK = "22.2.5";
     public static final String VIRGL = "23.1.9";
-    public static String DXVK = "2.7.1-1-gplasync-0";
+    public static String DXVK = "3.1.1-gamenativevr-1";
     public static final String D8VK = "1.0";
     public static String VKD3D = "2.14.1";
     public static final String CNC_DDRAW = "6.6";

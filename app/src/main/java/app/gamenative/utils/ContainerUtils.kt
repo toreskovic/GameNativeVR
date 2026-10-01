@@ -53,7 +53,7 @@ object ContainerUtils {
         DefaultVersion.VARIANT = Container.BIONIC
         DefaultVersion.WINE_VERSION = "proton-11.0-1-arm64ec-1"
         DefaultVersion.DEFAULT_GRAPHICS_DRIVER = "wrapper-gamenative"
-        DefaultVersion.DXVK = "2.7.1-1-gplasync-0"
+        DefaultVersion.DXVK = "3.1.1-gamenativevr-1"
         DefaultVersion.VKD3D = "2.14.1"
         DefaultVersion.WRAPPER = WRAPPER_PICO_A10
         DefaultVersion.STEAM_TYPE = Container.STEAM_TYPE_HEADLESS
