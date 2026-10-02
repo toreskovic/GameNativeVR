@@ -3,6 +3,7 @@ package app.gamenative.utils
 import android.content.Context
 import app.gamenative.BuildConfig
 import app.gamenative.PrefManager
+import com.winlator.core.DefaultVersion
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -18,7 +19,7 @@ object ManifestRepository {
         if (BuildConfig.DEBUG) {
             readLocalManifest(context)?.let {
                 Timber.i("ManifestRepository: using local debug manifest")
-                return withXrDriver(context, it)
+                return withXrComponents(context, it)
             }
         }
 
@@ -28,7 +29,7 @@ object ManifestRepository {
         val isStale = System.currentTimeMillis() - lastFetchedAt >= ONE_DAY_MS
 
         if (cachedJson.isNotEmpty() && !isStale) {
-            return withXrDriver(context, cachedManifest)
+            return withXrComponents(context, cachedManifest)
         }
 
         val fetched = fetchManifestJson()
@@ -38,14 +39,14 @@ object ManifestRepository {
                 val now = System.currentTimeMillis()
                 PrefManager.componentManifestJson = fetched
                 PrefManager.componentManifestFetchedAt = now
-                return withXrDriver(context, parsed)
+                return withXrComponents(context, parsed)
             }
         }
 
-        return withXrDriver(context, cachedManifest)
+        return withXrComponents(context, cachedManifest)
     }
 
-    private fun withXrDriver(context: Context, manifest: ManifestData): ManifestData {
+    private fun withXrComponents(context: Context, manifest: ManifestData): ManifestData {
         if (!BuildConfig.XR_BUILD) return manifest
         val bundled = try {
             context.assets.open("xr-manifest.json").bufferedReader().use { parseManifest(it.readText()) }
@@ -53,11 +54,18 @@ object ManifestRepository {
             Timber.w(e, "ManifestRepository: bundled XR manifest unavailable")
             null
         }
-        val entry = bundled?.items?.get(ManifestContentTypes.DRIVER)
-            ?.firstOrNull { it.id == ContainerUtils.WRAPPER_PICO_A10 } ?: return manifest
-        val drivers = manifest.items[ManifestContentTypes.DRIVER].orEmpty()
-        return manifest.copy(items = manifest.items +
-            (ManifestContentTypes.DRIVER to (listOf(entry) + drivers.filterNot { it.id == entry.id })))
+        if (bundled == null) return manifest
+        val items = manifest.items.toMutableMap()
+        // Keep this fork's pinned defaults available even if upstream omits or changes them.
+        val overrides = mapOf(
+            ManifestContentTypes.DRIVER to ContainerUtils.WRAPPER_PICO_A10,
+            ManifestContentTypes.PROTON to DefaultVersion.WINE_VERSION,
+        )
+        for ((type, id) in overrides) {
+            val entry = bundled.items[type]?.firstOrNull { it.id == id } ?: continue
+            items[type] = listOf(entry) + items[type].orEmpty().filterNot { it.id == id }
+        }
+        return manifest.copy(items = items)
     }
 
     private suspend fun fetchManifestJson(): String? = withContext(Dispatchers.IO) {

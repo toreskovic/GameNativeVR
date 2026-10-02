@@ -37,12 +37,21 @@ val copyDebugManifest by tasks.registering(Copy::class) {
     into(layout.buildDirectory.dir("generated/debugManifest"))
 }
 
-// XR releases retain the local Pico driver entry even when upstream/cached
-// manifests do not know about this fork's compatibility package yet.
+// XR releases retain the pinned Pico driver and Proton entries even when
+// upstream/cached manifests do not include this fork's defaults.
 val copyXrManifest by tasks.registering(Copy::class) {
     from(rootProject.file("manifest.json"))
     rename { "xr-manifest.json" }
     into(layout.buildDirectory.dir("generated/xrManifest"))
+}
+
+// AGP asset merging and lint consume the generated local catalog.
+tasks.matching {
+    (it.name.contains("LegacyXr") || it.name.contains("ModernXr")) &&
+        ((it.name.startsWith("merge") && it.name.endsWith("Assets")) ||
+            it.name.contains("lint", ignoreCase = true))
+}.configureEach {
+    dependsOn(copyXrManifest)
 }
 
 android {

@@ -24,7 +24,7 @@ public abstract class DefaultVersion {
     public static String STEAM_TYPE = STEAM_TYPE_HEADLESS;
     public static String VARIANT = Container.GLIBC;
     public static String DEFAULT_GRAPHICS_DRIVER = "wrapper-gamenative";
-    public static String WINE_VERSION = "proton-11.0-1-arm64ec-1";
+    public static String WINE_VERSION = "proton-11.0-7.1-arm64ec-9";
     public static String ASYNC = "1";
     public static String ASYNC_CACHE = "0";
 }

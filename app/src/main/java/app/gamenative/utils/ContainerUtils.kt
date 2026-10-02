@@ -51,7 +51,7 @@ object ContainerUtils {
 
     fun setContainerDefaults(context: Context) {
         DefaultVersion.VARIANT = Container.BIONIC
-        DefaultVersion.WINE_VERSION = "proton-11.0-1-arm64ec-1"
+        DefaultVersion.WINE_VERSION = "proton-11.0-7.1-arm64ec-9"
         DefaultVersion.DEFAULT_GRAPHICS_DRIVER = "wrapper-gamenative"
         DefaultVersion.DXVK = "3.1.1-gamenativevr-1"
         DefaultVersion.VKD3D = "2.14.1"
@@ -961,7 +961,10 @@ object ContainerUtils {
             kvs.put("transcoder", "gpu")
             val dxvkConfig = KeyValueSet(containerData.dxwrapperConfig)
             dxvkConfig.put("version", DefaultVersion.DXVK)
+            val envVars = EnvVars(containerData.envVars)
+            if (!envVars.has("WINENTSYNC")) envVars.put("WINENTSYNC", "1")
             containerData = containerData.copy(
+                envVars = envVars.toString(),
                 wineVersion = DefaultVersion.WINE_VERSION,
                 graphicsDriver = "wrapper-gamenative",
                 graphicsDriverConfig = kvs.toString(),
