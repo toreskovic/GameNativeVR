@@ -437,6 +437,8 @@ bool WindowsFrameTransport::handleFrameLine(int clientFd, const std::string& lin
         }
         latest_[eye].acquireFenceFd = acquireFenceFd;
         latest_[eye].serial = nextSerial_++;
+        latest_[eye].frameId = static_cast<uint64_t>(parseKey(line, "frame", 0));
+        latest_[eye].targetDisplayTime = parseKey(line, "target", 0);
         latestClaimed_[eye] = false;
         if (releaseFenceFds_[eye][index] >= 0) {
             ::close(releaseFenceFds_[eye][index]);
@@ -586,25 +588,32 @@ void WindowsFrameTransport::dropRetainedLocked(int eye) {
     held = EyeFrame{};
 }
 
-EyeFrame WindowsFrameTransport::pollEye(int eye) {
-    if (eye < 0 || eye >= kEyeCount) return EyeFrame{};
+bool WindowsFrameTransport::pollStereo(std::array<EyeFrame, 2> &frames) {
     std::lock_guard<std::mutex> lock(eyesMutex_);
-    EyeFrame snapshot = latest_[eye];
-    latest_[eye].acquireFenceFd = -1;
-    if (snapshot.kind == BufferKind::None) return snapshot;
-    latestClaimed_[eye] = true;
-    dropRetainedLocked(eye);
-    if (snapshot.kind == BufferKind::HardwareBuffer && snapshot.buffer != nullptr) {
-        AHardwareBuffer_acquire(snapshot.buffer);
-    } else if (snapshot.kind == BufferKind::DmaBuf) {
-        for (int plane = 0; plane < snapshot.planeCount; ++plane) {
-            snapshot.dmabufFds[plane] =
-                snapshot.dmabufFds[plane] >= 0 ? ::dup(snapshot.dmabufFds[plane]) : -1;
+    // FRAME messages arrive separately. Do not expose a partial update, or claim
+    // fences until both eyes are ready. The last OpenXR image covers this interval.
+    if (latest_[0].kind == BufferKind::None || latest_[1].kind == BufferKind::None ||
+        latestClaimed_[0] || latestClaimed_[1] ||
+        latest_[0].frameId == 0 || latest_[0].frameId != latest_[1].frameId)
+        return false;
+    for (int eye = 0; eye < kEyeCount; ++eye) {
+        EyeFrame snapshot = latest_[eye];
+        latest_[eye].acquireFenceFd = -1;
+        latestClaimed_[eye] = true;
+        dropRetainedLocked(eye);
+        if (snapshot.kind == BufferKind::HardwareBuffer && snapshot.buffer != nullptr) {
+            AHardwareBuffer_acquire(snapshot.buffer);
+        } else if (snapshot.kind == BufferKind::DmaBuf) {
+            for (int plane = 0; plane < snapshot.planeCount; ++plane) {
+                snapshot.dmabufFds[plane] =
+                    snapshot.dmabufFds[plane] >= 0 ? ::dup(snapshot.dmabufFds[plane]) : -1;
+            }
         }
+        retained_[eye] = snapshot;
+        retained_[eye].acquireFenceFd = -1;
+        frames[eye] = snapshot;
     }
-    retained_[eye] = snapshot;
-    retained_[eye].acquireFenceFd = -1;
-    return snapshot;
+    return true;
 }
 
 void WindowsFrameTransport::publishReleaseFence(int eye, int imageIndex, int releaseFenceFd) {

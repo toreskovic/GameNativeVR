@@ -93,7 +93,14 @@ class WindowsVrControlServer(
             "GET_BOUNDS" -> if (tokens.size == 1) getBounds() else "ERROR malformed"
             "WAIT_FRAME" -> if (tokens.size == 1) waitFrame() else "ERROR malformed"
             "FRAME_SYNC" -> if (tokens.size == 1) frameSync() else "ERROR malformed"
-            "LOCATE_VIEWS" -> if (tokens.size == 1) locateViews() else "ERROR malformed"
+            "LOCATE_VIEWS" -> when {
+                tokens.size == 1 -> locateViews()
+                tokens.size == 2 && tokens[1].startsWith("time=") -> {
+                    val time = tokens[1].substringAfter("=").toLongOrNull()
+                    if (time == null || time <= 0L) "ERROR time_invalid" else locateViews(time)
+                }
+                else -> "ERROR malformed"
+            }
             "GET_INPUT" -> getInput(tokens)
             "HAPTIC" -> haptic(tokens)
             "BEGIN_SESSION" -> if (tokens.size == 1) {
@@ -208,8 +215,9 @@ class WindowsVrControlServer(
         return "OK available=${snapshot.timing[7]} width=${snapshot.timing[8]} height=${snapshot.timing[9]} supported=${snapshot.timing[10]}"
     }
 
-    private fun locateViews(): String {
-        val snapshot = snapshots.latest() ?: return "ERROR unavailable"
+    private fun locateViews(time: Long? = null): String {
+        val snapshot = (if (time == null) snapshots.latest() else snapshots.locateViews(time))
+            ?: return "ERROR unavailable"
         // Scale tangent-plane extents about their midpoint, preserving eye asymmetry.
         val views = snapshot.views.copyOf()
         val fovScale = config.fovScalePercent.coerceIn(70, 100) / 100.0

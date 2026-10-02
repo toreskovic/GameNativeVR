@@ -145,6 +145,31 @@ Java_app_gamenative_ui_screen_xr_XrNative_nativeGetWindowsXrTime(JNIEnv *, jclas
 }
 
 JNIEXPORT jboolean JNICALL
+Java_app_gamenative_ui_screen_xr_XrNative_nativeLocateWindowsViews(
+    JNIEnv *env, jclass, jlong handlePtr, jlong time, jfloatArray outViews, jintArray outFlags) {
+    if (env->GetArrayLength(outViews) < 22 || env->GetArrayLength(outFlags) < 1) return JNI_FALSE;
+    std::array<XrView, 2> views{};
+    XrViewStateFlags flags = 0;
+    {
+        std::lock_guard<std::mutex> lock(gHandleMutex);
+        NativeHandle *handle = LiveHandle(handlePtr);
+        if (!handle || !handle->session->locateWindowsViews(time, &views, &flags)) return JNI_FALSE;
+    }
+    jfloat values[22]{};
+    for (size_t eye = 0; eye < 2; ++eye) {
+        const auto &v = views[eye];
+        const float fields[11] = {v.pose.orientation.x, v.pose.orientation.y, v.pose.orientation.z,
+            v.pose.orientation.w, v.pose.position.x, v.pose.position.y, v.pose.position.z,
+            v.fov.angleLeft, v.fov.angleRight, v.fov.angleUp, v.fov.angleDown};
+        std::copy(fields, fields + 11, values + eye * 11);
+    }
+    env->SetFloatArrayRegion(outViews, 0, 22, values);
+    const jint out = static_cast<jint>(flags);
+    env->SetIntArrayRegion(outFlags, 0, 1, &out);
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
 Java_app_gamenative_ui_screen_xr_XrNative_nativeWaitWindowsFrame(
     JNIEnv *env, jclass, jlong handlePtr, jlong afterSerial, jint timeoutMs,
     jlongArray outTiming, jfloatArray outViews, jfloatArray outInput, jintArray outFlags) {

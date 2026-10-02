@@ -110,6 +110,7 @@ public:
     void join();
 
     XrTime currentWindowsXrTime() const;
+    bool locateWindowsViews(XrTime time, std::array<XrView, 2> *views, XrViewStateFlags *flags);
     InputSnapshot pollSnapshot();
     bool waitWindowsRuntimeSnapshot(uint64_t afterSerial, uint32_t timeoutMs,
                                     WindowsRuntimeSnapshot *snapshot);
@@ -149,6 +150,8 @@ public:
     void setSharedGameBuffer(AHardwareBuffer *buffer);
 
 private:
+    std::mutex windowsLocateMutex_;
+    bool windowsViewsReady_ = false;
     void runLoop();
     bool setupInstanceAndSession();
     void teardown();

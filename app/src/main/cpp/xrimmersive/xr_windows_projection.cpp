@@ -329,21 +329,14 @@ bool WindowsProjectionPresenter::uploadLinearDmabufToTexture(
     return true;
 }
 
-bool WindowsProjectionPresenter::importEyeBuffer(WindowsFrameTransport &transport, uint32_t eye,
+bool WindowsProjectionPresenter::importEyeBuffer(uint32_t eye,
                                                  EyeFrame &frame, bool &fresh) {
-    frame = transport.pollEye(static_cast<int>(eye));
-    if (frame.kind == BufferKind::None) return false;
-    fresh = frame.serial != renderedSerials_[eye];
-    if (!waitForAcquireFence(frame.acquireFenceFd)) {
-        transport.discardFrame(static_cast<int>(eye), frame.imageIndex, frame.serial);
-        if (fresh) renderedSerials_[eye] = frame.serial;
-        return false;
-    }
-    frame.acquireFenceFd = -1;
-    if (frame.imageIndex < 0 || frame.imageIndex >= WindowsFrameTransport::kMaxImages) {
-        transport.discardFrame(static_cast<int>(eye), frame.imageIndex, frame.serial);
-        return false;
-    }
+    // pollStereo already claimed both eyes and transferred their acquire fences.
+    fresh = true;
+    const int fence = frame.acquireFenceFd;
+    frame.acquireFenceFd = -1; // waitForAcquireFence consumes it even on failure.
+    if (!waitForAcquireFence(fence)) return false;
+    if (frame.imageIndex < 0 || frame.imageIndex >= WindowsFrameTransport::kMaxImages) return false;
     const int image = frame.imageIndex;
     EGLImageKHR &cachedImage = eglImages_[eye][image];
     GLuint &cachedTexture = textures_[eye][image];
@@ -380,7 +373,6 @@ bool WindowsProjectionPresenter::importEyeBuffer(WindowsFrameTransport &transpor
         }
     }
     if (imported == EGL_NO_IMAGE_KHR) {
-        transport.discardFrame(static_cast<int>(eye), image, frame.serial);
         return false;
     }
     if (cachedTexture == 0) glGenTextures(1, &cachedTexture);
@@ -390,7 +382,6 @@ bool WindowsProjectionPresenter::importEyeBuffer(WindowsFrameTransport &transpor
     if (error != GL_NO_ERROR) {
         glBindTexture(GL_TEXTURE_2D, 0);
         eglDestroyImageKHR(display_, imported);
-        transport.discardFrame(static_cast<int>(eye), image, frame.serial);
         return false;
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -444,18 +435,34 @@ void WindowsProjectionPresenter::discardFresh(WindowsFrameTransport &transport,
                                                const std::array<bool, 2> &fresh) {
     for (uint32_t eye = 0; eye < 2; ++eye) {
         if (!fresh[eye]) continue;
+        if (frames[eye].acquireFenceFd >= 0) close(frames[eye].acquireFenceFd);
         transport.discardFrame(static_cast<int>(eye), frames[eye].imageIndex, frames[eye].serial);
         renderedSerials_[eye] = frames[eye].serial;
     }
 }
 
 bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpace space,
-                                        XrCompositionLayerProjection *layer) {
-    if (layer == nullptr || !transport.hasStereoContent()) return false;
+                                        XrCompositionLayerProjection *layer, XrTime displayTime) {
+    if (layer == nullptr) return false;
+    if (!transport.hasStereoContent()) {
+        hasPresentedImage_ = false;
+        return false;
+    }
     std::array<EyeFrame, 2> frames{};
-    std::array<bool, 2> fresh{false, false};
+    if (!transport.pollStereo(frames)) {
+        if (!hasPresentedImage_) return false;
+        // xrEndFrame references the last released image. Keep its rendering pose
+        // and FOV, with no acquire, GL work, import or guest-buffer access.
+        *layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        layer->space = space;
+        layer->viewCount = 2;
+        layer->views = views_.data();
+        recordPresentation(displayedFrames_, displayTime, true);
+        return true;
+    }
+    std::array<bool, 2> fresh{true, true};
     for (uint32_t eye = 0; eye < 2; ++eye) {
-        if (!importEyeBuffer(transport, eye, frames[eye], fresh[eye])) {
+        if (!importEyeBuffer(eye, frames[eye], fresh[eye])) {
             discardFresh(transport, frames, fresh);
             return false;
         }
@@ -466,6 +473,7 @@ bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpac
         discardFresh(transport, frames, fresh);
         return false;
     }
+    hasPresentedImage_ = false;
     XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     wait.timeout = XR_INFINITE_DURATION;
     if (XR_FAILED(xrWaitSwapchainImage(swapchain_, &wait))) {
@@ -537,10 +545,50 @@ bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpac
     layer->space = space;
     layer->viewCount = 2;
     layer->views = views_.data();
+    hasPresentedImage_ = true;
+    displayedFrames_ = frames;
+    recordPresentation(frames, displayTime, false);
     return true;
 }
 
+void WindowsProjectionPresenter::recordPresentation(const std::array<EyeFrame, 2> &frames,
+                                                     XrTime displayTime, bool reused) {
+    if (reused) ++reusedImages_;
+    // Target lateness is presentation-slot time minus the guest's intended display time;
+    // it is not a GPU duration or a claim about physical scanout time.
+    if (timingLogStart_ == 0) timingLogStart_ = displayTime;
+    ++presentedPairs_;
+    if (frames[0].frameId && frames[1].frameId) {
+        if (frames[0].frameId == previousFrameIds_[0] && frames[1].frameId == previousFrameIds_[1])
+            ++repeatedPairs_;
+        if (frames[0].frameId != frames[1].frameId) ++mixedPairs_;
+    }
+    for (size_t eye = 0; eye < 2; ++eye) {
+        previousFrameIds_[eye] = frames[eye].frameId;
+        if (frames[eye].targetDisplayTime <= 0) continue;
+        const double lateMs = (displayTime - frames[eye].targetDisplayTime) / 1000000.0;
+        latenessSumMs_ += lateMs;
+        if (timedEyes_ == 0 || lateMs > latenessMaxMs_) latenessMaxMs_ = lateMs;
+        ++timedEyes_;
+    }
+    if (displayTime - timingLogStart_ >= 5000000000LL) {
+        LOGI("VR presentation: pairs=%llu repeated=%llu mixed=%llu reusedImages=%llu timedEyes=%llu targetLateMs(avg/max)=%.2f/%.2f",
+             (unsigned long long)presentedPairs_, (unsigned long long)repeatedPairs_,
+             (unsigned long long)mixedPairs_, (unsigned long long)reusedImages_, (unsigned long long)timedEyes_,
+             timedEyes_ ? latenessSumMs_ / timedEyes_ : 0.0, latenessMaxMs_);
+        timingLogStart_ = displayTime;
+        presentedPairs_ = repeatedPairs_ = mixedPairs_ = timedEyes_ = reusedImages_ = 0;
+        latenessSumMs_ = latenessMaxMs_ = 0;
+    }
+}
+
 void WindowsProjectionPresenter::shutdown() {
+    hasPresentedImage_ = false;
+    displayedFrames_ = {};
+    previousFrameIds_ = {};
+    timingLogStart_ = 0;
+    presentedPairs_ = repeatedPairs_ = mixedPairs_ = timedEyes_ = reusedImages_ = 0;
+    latenessSumMs_ = latenessMaxMs_ = 0;
     if (sceneFramebuffer_) glDeleteFramebuffers(1, &sceneFramebuffer_);
     if (sceneTexture_) glDeleteTextures(1, &sceneTexture_);
     if (borderProgram_) glDeleteProgram(borderProgram_);

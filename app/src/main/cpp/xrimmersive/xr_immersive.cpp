@@ -91,6 +91,23 @@ bool XrImmersiveSession::waitWindowsRuntimeSnapshot(uint64_t afterSerial, uint32
     return true;
 }
 
+bool XrImmersiveSession::locateWindowsViews(XrTime time, std::array<XrView, 2> *views,
+                                            XrViewStateFlags *flags) {
+    std::lock_guard<std::mutex> lock(windowsLocateMutex_);
+    if (!windowsViewsReady_ || time <= 0 || stopRequested_.load()) return false;
+    XrViewLocateInfo info{XR_TYPE_VIEW_LOCATE_INFO};
+    info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    info.displayTime = time;
+    info.space = windowsTrackingSpace_;
+    XrViewState state{XR_TYPE_VIEW_STATE};
+    for (auto &view : *views) view = {XR_TYPE_VIEW};
+    uint32_t count = 0;
+    if (XR_FAILED(xrLocateViews(session_, &info, &state, 2, &count, views->data())) || count != 2)
+        return false;
+    *flags = state.viewStateFlags;
+    return true;
+}
+
 bool XrImmersiveSession::windowsStereoActive() const {
     return stereoActive_.load();
 }
@@ -287,6 +304,10 @@ void XrImmersiveSession::runLoop() {
         {
             std::lock_guard<std::mutex> lock(windowsSnapshotMutex_);
             windowsSnapshot_ = runtimeSnapshot;
+        }
+        {
+            std::lock_guard<std::mutex> lock(windowsLocateMutex_);
+            windowsViewsReady_ = true;
         }
         windowsSnapshotCondition_.notify_all();
 
@@ -1143,7 +1164,7 @@ bool XrImmersiveSession::submitWindowsProjection(XrTime predictedDisplayTime) {
         return false;
     }
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-    if (!windowsProjection_.render(windowsTransport_, windowsTrackingSpace_, &projection)) {
+    if (!windowsProjection_.render(windowsTransport_, windowsTrackingSpace_, &projection, predictedDisplayTime)) {
         if (++stereoMisses_ >= 8) stereoActive_.store(false);
         return false;
     }
@@ -1614,6 +1635,11 @@ XrTime XrImmersiveSession::currentWindowsXrTime() const {
 }
 
 void XrImmersiveSession::teardown() {
+    // Drain any live locate call before destroying its session/reference space.
+    {
+        std::lock_guard<std::mutex> lock(windowsLocateMutex_);
+        windowsViewsReady_ = false;
+    }
     windowsClockReady_.store(false, std::memory_order_release);
     stereoActive_.store(false);
     stereoMisses_ = 0;

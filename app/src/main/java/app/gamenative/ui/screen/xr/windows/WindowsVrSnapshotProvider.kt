@@ -53,6 +53,15 @@ class WindowsVrSnapshotProvider {
         if (handle == 0L) 0L else XrNative.nativeGetWindowsXrTime(handle)
     }
 
+    fun locateViews(time: Long): WindowsVrRuntimeSnapshot? = synchronized(lock) {
+        val current = latest ?: return null
+        if (handle == 0L || time <= 0L) return null
+        val views = FloatArray(22)
+        val flags = current.flags.copyOf()
+        if (!XrNative.nativeLocateWindowsViews(handle, time, views, flags)) return null
+        current.copy(views = views, flags = flags)
+    }
+
     fun latest(): WindowsVrRuntimeSnapshot? = latest
 
     fun applyHaptic(hand: Int, amplitude: Float, duration: Long, frequency: Float): Boolean {

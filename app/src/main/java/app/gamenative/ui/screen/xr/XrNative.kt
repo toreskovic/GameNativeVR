@@ -47,6 +47,8 @@ object XrNative {
 
     external fun nativeGetWindowsXrTime(handle: Long): Long
 
+    external fun nativeLocateWindowsViews(handle: Long, time: Long, views: FloatArray, flags: IntArray): Boolean
+
     external fun nativeWaitWindowsFrame(
         handle: Long,
         afterSerial: Long,

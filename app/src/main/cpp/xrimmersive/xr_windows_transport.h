@@ -19,6 +19,7 @@
 
 #include <android/hardware_buffer.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -63,6 +64,8 @@ struct EyeFrame {
     int32_t acquireFenceFd{-1};
     uint64_t registrationSerial{0};
     uint64_t serial{0};
+    uint64_t frameId{0};
+    int64_t targetDisplayTime{0};
 };
 
 class WindowsFrameTransport {
@@ -80,7 +83,8 @@ public:
 
     void stop();
 
-    EyeFrame pollEye(int eye);
+    // Claim both eyes under one lock, only once and only for the same game frame.
+    bool pollStereo(std::array<EyeFrame, 2> &frames);
 
     void publishReleaseFence(int eye, int imageIndex, int releaseFenceFd);
 

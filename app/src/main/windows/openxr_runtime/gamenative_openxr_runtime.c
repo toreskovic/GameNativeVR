@@ -2293,8 +2293,67 @@ static int gn_space_absolute_pose(
     return -1;
 }
 
+static XrResult gn_refresh_views_at(XrTime time, XrViewStateFlags *flags) {
+    char response[1024];
+    // Query the headset runtime for the requested time, including late pose updates.
+    // Cached FRAME_SYNC views are not necessarily predicted for this display time.
+    char request[96];
+    if (time <= 0) return XR_ERROR_TIME_INVALID;
+    gn_size request_len = gn_append(request, sizeof(request), 0, "LOCATE_VIEWS time=");
+    gn_append_i64(request, sizeof(request), request_len, time);
+    if (!gn_bridge_call(request, response, sizeof(response)) || !gn_starts_with(response, "OK"))
+        return XR_ERROR_RUNTIME_FAILURE;
+    {
+        static const char* qk[2][4] = {{"lqx", "lqy", "lqz", "lqw"}, {"rqx", "rqy", "rqz", "rqw"}};
+        static const char* pk[2][3] = {{"lpx", "lpy", "lpz"}, {"rpx", "rpy", "rpz"}};
+        static const char* fk[2][4] = {{"lfl", "lfr", "lfu", "lfd"}, {"rfl", "rfr", "rfu", "rfd"}};
+        for (int eye = 0; eye < 2; ++eye) {
+            GnEyeView* v = &gn_eye_views[eye];
+            for (int i = 0; i < 4; ++i) v->quat[i] = gn_parse_micro(response, qk[eye][i], i == 3 ? 1.0f : 0.0f);
+            for (int i = 0; i < 3; ++i) v->pos[i] = gn_parse_micro(response, pk[eye][i], 0.0f);
+            v->fov[0] = gn_parse_micro(response, fk[eye][0], -0.75f);
+            v->fov[1] = gn_parse_micro(response, fk[eye][1], 0.75f);
+            v->fov[2] = gn_parse_micro(response, fk[eye][2], 0.75f);
+            v->fov[3] = gn_parse_micro(response, fk[eye][3], -0.75f);
+        }
+        gn_eye_views_valid = 1;
+        {
+            XrPosef head_pose;
+            gn_get_head_pose(&head_pose);
+            if (!gn_local_origin_valid) {
+                gn_local_origin = head_pose;
+                gn_level_pose(&gn_local_origin);
+                gn_local_origin_valid = 1;
+            }
+            gn_update_pose_velocity(
+                &head_pose,
+                time,
+                &gn_last_head_pose,
+                &gn_last_head_time,
+                gn_head_linear_velocity,
+                gn_head_angular_velocity,
+                gn_recenter_serial_supported ? 0 : 1);
+        }
+    }
+
+    *flags = (XrViewStateFlags)gn_parse_i64(response, "flags", 0);
+    return XR_SUCCESS;
+}
+
 static XrResult XRAPI_CALL gn_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation* location) {
-    (void)time;
+    if (time <= 0) return XR_ERROR_TIME_INVALID;
+    XrViewStateFlags head_flags = XR_VIEW_STATE_ORIENTATION_VALID_BIT |
+        XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_TRACKED_BIT |
+        XR_VIEW_STATE_POSITION_TRACKED_BIT;
+    int source_ref = gn_ref_space_index(space);
+    int base_ref = gn_ref_space_index(baseSpace);
+    // OpenVR compatibility clients may query the VIEW space for the head pose
+    // before locating the individual eyes. Refresh that path at the requested time too.
+    if ((source_ref >= 0 && gn_ref_spaces[source_ref].type == XR_REFERENCE_SPACE_TYPE_VIEW) ||
+        (base_ref >= 0 && gn_ref_spaces[base_ref].type == XR_REFERENCE_SPACE_TYPE_VIEW)) {
+        XrResult result = gn_refresh_views_at(time, &head_flags);
+        if (XR_FAILED(result)) return result;
+    }
     XrPosef absolute_pose, base_pose;
     float linear[3], angular[3], base_linear[3], base_angular[3];
     if (!location) return XR_ERROR_VALIDATION_FAILURE;
@@ -2337,11 +2396,11 @@ static XrResult XRAPI_CALL gn_xrLocateSpace(XrSpace space, XrSpace baseSpace, Xr
     gn_identity_pose(&location->pose);
     if (space_status == 0 || base_status == 0) return XR_SUCCESS;
     location->pose = gn_pose_multiply(gn_pose_inverse(base_pose), absolute_pose);
-    location->locationFlags =
-        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
-        XR_SPACE_LOCATION_POSITION_VALID_BIT |
-        XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT |
-        XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+    location->locationFlags = 0;
+    if (head_flags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) location->locationFlags |= XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    if (head_flags & XR_VIEW_STATE_POSITION_VALID_BIT) location->locationFlags |= XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    if (head_flags & XR_VIEW_STATE_ORIENTATION_TRACKED_BIT) location->locationFlags |= XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+    if (head_flags & XR_VIEW_STATE_POSITION_TRACKED_BIT) location->locationFlags |= XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
     return XR_SUCCESS;
 }
 
@@ -2546,6 +2605,7 @@ static XrResult XRAPI_CALL gn_xrEndFrame(XrSession session, const XrFrameEndInfo
                 break;
             }
             struct gn_unix_submit_view_args* view = &args.views[eye];
+            view->target_display_time = frameEndInfo->displayTime;
             view->slot = (gn_u32)slot;
             view->image_index = state->last_released_image;
             view->eye = eye;
@@ -2633,7 +2693,6 @@ static XrResult XRAPI_CALL gn_xrLocateViews(
     gn_uint32 capacity,
     gn_uint32* count,
     XrView* views) {
-    char response[1024];
     if (session != gn_session) return XR_ERROR_HANDLE_INVALID;
     if (!viewLocateInfo || viewLocateInfo->type != XR_TYPE_VIEW_LOCATE_INFO ||
         !viewState || viewState->type != XR_TYPE_VIEW_STATE || !count ||
@@ -2652,39 +2711,9 @@ static XrResult XRAPI_CALL gn_xrLocateViews(
             return XR_ERROR_VALIDATION_FAILURE;
     }
 
-    if (gn_cached_line("views", 0, response, sizeof(response)) ||
-        gn_bridge_call("LOCATE_VIEWS", response, sizeof(response))) {
-        static const char* qk[2][4] = {{"lqx", "lqy", "lqz", "lqw"}, {"rqx", "rqy", "rqz", "rqw"}};
-        static const char* pk[2][3] = {{"lpx", "lpy", "lpz"}, {"rpx", "rpy", "rpz"}};
-        static const char* fk[2][4] = {{"lfl", "lfr", "lfu", "lfd"}, {"rfl", "rfr", "rfu", "rfd"}};
-        for (int eye = 0; eye < 2; ++eye) {
-            GnEyeView* v = &gn_eye_views[eye];
-            for (int i = 0; i < 4; ++i) v->quat[i] = gn_parse_micro(response, qk[eye][i], i == 3 ? 1.0f : 0.0f);
-            for (int i = 0; i < 3; ++i) v->pos[i] = gn_parse_micro(response, pk[eye][i], 0.0f);
-            v->fov[0] = gn_parse_micro(response, fk[eye][0], -0.75f);
-            v->fov[1] = gn_parse_micro(response, fk[eye][1], 0.75f);
-            v->fov[2] = gn_parse_micro(response, fk[eye][2], 0.75f);
-            v->fov[3] = gn_parse_micro(response, fk[eye][3], -0.75f);
-        }
-        gn_eye_views_valid = 1;
-        {
-            XrPosef head_pose;
-            gn_get_head_pose(&head_pose);
-            if (!gn_local_origin_valid) {
-                gn_local_origin = head_pose;
-                gn_level_pose(&gn_local_origin);
-                gn_local_origin_valid = 1;
-            }
-            gn_update_pose_velocity(
-                &head_pose,
-                viewLocateInfo ? viewLocateInfo->displayTime : gn_next_display_time,
-                &gn_last_head_pose,
-                &gn_last_head_time,
-                gn_head_linear_velocity,
-                gn_head_angular_velocity,
-                gn_recenter_serial_supported ? 0 : 1);
-        }
-    }
+    XrViewStateFlags located_flags = 0;
+    XrResult locate_result = gn_refresh_views_at(viewLocateInfo->displayTime, &located_flags);
+    if (XR_FAILED(locate_result)) return locate_result;
 
     XrPosef base_pose;
     float base_linear[3], base_angular[3];
@@ -2695,9 +2724,7 @@ static XrResult XRAPI_CALL gn_xrLocateViews(
 
     viewState->viewStateFlags = 0;
     if (gn_eye_views_valid && base_status > 0) {
-        viewState->viewStateFlags =
-            XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT |
-            XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT;
+        viewState->viewStateFlags = located_flags;
     }
     for (gn_uint32 i = 0; i < 2; ++i) {
         if (gn_eye_views_valid) {

@@ -19,10 +19,19 @@ namespace xrimmersive::windowsvr {
 class WindowsProjectionPresenter {
 public:
     bool initialize(XrSession session, int64_t format, uint32_t width, uint32_t height, EGLDisplay display, int upscaler, float sgsrSharpness, float fovScale, int fovBorder);
-    bool render(WindowsFrameTransport &transport, XrSpace space, XrCompositionLayerProjection *layer);
+    bool render(WindowsFrameTransport &transport, XrSpace space, XrCompositionLayerProjection *layer, XrTime displayTime);
     void shutdown();
 
 private:
+    bool hasPresentedImage_ = false;
+    // Only frame IDs and target times are read from this non-owning metadata copy.
+    std::array<EyeFrame, 2> displayedFrames_{};
+    uint64_t reusedImages_ = 0;
+    void recordPresentation(const std::array<EyeFrame, 2> &frames, XrTime displayTime, bool reused);
+    XrTime timingLogStart_ = 0;
+    uint64_t presentedPairs_ = 0, repeatedPairs_ = 0, mixedPairs_ = 0, timedEyes_ = 0;
+    std::array<uint64_t, 2> previousFrameIds_{};
+    double latenessSumMs_ = 0, latenessMaxMs_ = 0;
     bool ensureProgram();
     EGLImageKHR createImageFromHardwareBuffer(AHardwareBuffer *buffer);
     EGLImageKHR createImageFromDmabuf(const EyeFrame &frame);
@@ -30,7 +39,7 @@ private:
     int createReleaseFence();
     bool uploadLinearDmabufToTexture(uint32_t eye, int imageIndex, const EyeFrame &frame,
                                     GLuint &texture, uint64_t &cachedRegistration);
-    bool importEyeBuffer(WindowsFrameTransport &transport, uint32_t eye, EyeFrame &frame, bool &fresh);
+    bool importEyeBuffer(uint32_t eye, EyeFrame &frame, bool &fresh);
     void drawEye(uint32_t eye, const EyeFrame &source, uint32_t imageIndex);
     void discardFresh(WindowsFrameTransport &transport, const std::array<EyeFrame, 2> &frames,
                       const std::array<bool, 2> &fresh);

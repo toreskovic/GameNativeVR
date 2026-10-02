@@ -2217,13 +2217,14 @@ static int send_frame(const struct gn_unix_submit_view_args *view, int fence_fd,
     const uint32_t transport_index =
         view->slot * GN_UNIX_MAX_IMAGES + view->image_index;
     snprintf(line, sizeof(line),
-             "FRAME frame=%llu eye=%u index=%u fence=%u x=%d y=%d w=%u h=%u flip=%u "
+             "FRAME frame=%llu eye=%u index=%u fence=%u x=%d y=%d w=%u h=%u flip=%u target=%lld "
              "projection=1 qx=%lld qy=%lld qz=%lld qw=%lld "
              "px=%lld py=%lld pz=%lld fl=%lld fr=%lld fu=%lld fd=%lld\n",
              (unsigned long long)frame_id, view->eye, transport_index,
              fence_fd >= 0 ? 1u : 0u,
              view->rect_x, view->rect_y, view->rect_width, view->rect_height,
              view->flip_y ? 1u : 0u,
+             (long long)view->target_display_time,
              (long long)view->orientation_micro[0],
              (long long)view->orientation_micro[1],
              (long long)view->orientation_micro[2],
