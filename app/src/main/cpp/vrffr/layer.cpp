@@ -17,10 +17,15 @@
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
 #include "descriptor_trace.h"
+#include "inline_list.h"
 #define EXPORT extern "C" __attribute__((visibility("default")))
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "GN-VR-FFR", __VA_ARGS__)
 #define DEBUG_LOG(d, ...) do { if ((d)->debug) LOG(__VA_ARGS__); } while (0)
 namespace {
+// Protect layer metadata. Hot-path hooks copy the immutable downstream function
+// pointer and unlock before forwarding, with no metadata access afterward.
+// Vulkan callers must externally synchronize command-buffer/queue use and object
+// destruction; the layer lock must not become a cross-thread driver lock.
 std::recursive_mutex lock;
 void *key(const void *h) {
   return h ? *reinterpret_cast<void *const *>(h) : nullptr;
@@ -57,14 +62,20 @@ struct DrawBatch {
   uint32_t count = 0, draws = 0, indexed = 0, indexedVertices = 0;
 };
 struct SampledDraw {
-  std::vector<VkImageView> views;
+  ffr::InlineList<VkImageView, 32> views;
   bool complete = true;
   std::array<VkViewport, 2> viewports{};
   std::array<VkRect2D, 2> scissors{};
   uint32_t viewportCount = 0, scissorCount = 0;
-  std::vector<std::pair<std::shared_ptr<descriptor_trace::Set>, uint64_t>> revisions;
+  ffr::InlineList<std::pair<std::shared_ptr<descriptor_trace::Set>, uint64_t>, 8> revisions;
 };
 struct Commands {
+  mutable uint64_t viewportCacheEpoch = 0;
+  mutable VkImage viewportCacheColor{};
+  mutable uint32_t viewportCacheCount = 0;
+  mutable std::array<VkViewport, 2> viewportCacheViews{};
+  mutable bool viewportCacheResult = false;
+
   std::array<std::shared_ptr<descriptor_trace::Set>, 8> descriptorSets;
   VkPipelineLayout descriptorLayout{};
   std::vector<SampledDraw> sampledDraws;
@@ -110,7 +121,7 @@ struct Map {
   VkCommandPool pool{};
   VkCommandBuffer cmd{};
   VkFence fence{};
-  bool submitted = false, failed = false;
+  bool submitted = false, failed = false, ready = false;
 };
 struct Device {
   VkDevice handle{};
@@ -128,6 +139,7 @@ struct Device {
   struct SampledLink { VkImage source{}, destination{}; uint32_t observations = 0; uint64_t epoch = 0; };
   std::vector<SampledLink> sampledLinks;
   uint64_t sampledEpoch = 0;
+  uint64_t eyeGraphEpoch = 1;
   uint64_t recordingFrame = 0, imageIdentity = 0;
   unsigned sampledSelections = 0;
   std::unordered_map<std::string, unsigned> sampledGates;
@@ -206,7 +218,46 @@ struct Device {
   PFN_vkUnmapMemory vkUnmapMemory = nullptr;
   PFN_vkCmdSetViewport vkCmdSetViewport = nullptr;
   PFN_vkCmdSetViewportWithCount vkCmdSetViewportWithCount = nullptr;
+  PFN_vkAllocateDescriptorSets vkAllocateDescriptorSets = nullptr;
+  PFN_vkCmdBindDescriptorSets vkCmdBindDescriptorSets = nullptr;
+  PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR = nullptr;
+  PFN_vkCmdPushDescriptorSetWithTemplateKHR vkCmdPushDescriptorSetWithTemplateKHR = nullptr;
+  PFN_vkCmdSetScissor vkCmdSetScissor = nullptr;
+  PFN_vkCmdSetScissorWithCount vkCmdSetScissorWithCount = nullptr;
+  PFN_vkCreateDescriptorSetLayout vkCreateDescriptorSetLayout = nullptr;
+  PFN_vkCreateDescriptorUpdateTemplate vkCreateDescriptorUpdateTemplate = nullptr;
+  PFN_vkCreatePipelineLayout vkCreatePipelineLayout = nullptr;
+  PFN_vkDestroyDescriptorPool vkDestroyDescriptorPool = nullptr;
+  PFN_vkDestroyDescriptorSetLayout vkDestroyDescriptorSetLayout = nullptr;
+  PFN_vkDestroyDescriptorUpdateTemplate vkDestroyDescriptorUpdateTemplate = nullptr;
+  PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout = nullptr;
+  PFN_vkFreeDescriptorSets vkFreeDescriptorSets = nullptr;
+  PFN_vkResetDescriptorPool vkResetDescriptorPool = nullptr;
+  PFN_vkUpdateDescriptorSetWithTemplate vkUpdateDescriptorSetWithTemplate = nullptr;
+  PFN_vkUpdateDescriptorSets vkUpdateDescriptorSets = nullptr;
   void loadFunctions() {
+    vkAllocateDescriptorSets = reinterpret_cast<PFN_vkAllocateDescriptorSets>(next(handle, "vkAllocateDescriptorSets"));
+    vkCmdBindDescriptorSets = reinterpret_cast<PFN_vkCmdBindDescriptorSets>(next(handle, "vkCmdBindDescriptorSets"));
+    vkCmdPushDescriptorSetKHR = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(next(handle, "vkCmdPushDescriptorSetKHR"));
+    vkCmdPushDescriptorSetWithTemplateKHR = reinterpret_cast<PFN_vkCmdPushDescriptorSetWithTemplateKHR>(next(handle, "vkCmdPushDescriptorSetWithTemplateKHR"));
+    vkCmdSetScissor = reinterpret_cast<PFN_vkCmdSetScissor>(next(handle, "vkCmdSetScissor"));
+    vkCmdSetScissorWithCount = reinterpret_cast<PFN_vkCmdSetScissorWithCount>(next(handle, "vkCmdSetScissorWithCount"));
+    vkCreateDescriptorSetLayout = reinterpret_cast<PFN_vkCreateDescriptorSetLayout>(next(handle, "vkCreateDescriptorSetLayout"));
+    vkCreateDescriptorUpdateTemplate = reinterpret_cast<PFN_vkCreateDescriptorUpdateTemplate>(next(handle, "vkCreateDescriptorUpdateTemplate"));
+    vkCreatePipelineLayout = reinterpret_cast<PFN_vkCreatePipelineLayout>(next(handle, "vkCreatePipelineLayout"));
+    vkDestroyDescriptorPool = reinterpret_cast<PFN_vkDestroyDescriptorPool>(next(handle, "vkDestroyDescriptorPool"));
+    vkDestroyDescriptorSetLayout = reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(next(handle, "vkDestroyDescriptorSetLayout"));
+    vkDestroyDescriptorUpdateTemplate = reinterpret_cast<PFN_vkDestroyDescriptorUpdateTemplate>(next(handle, "vkDestroyDescriptorUpdateTemplate"));
+    vkDestroyPipelineLayout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(next(handle, "vkDestroyPipelineLayout"));
+    vkFreeDescriptorSets = reinterpret_cast<PFN_vkFreeDescriptorSets>(next(handle, "vkFreeDescriptorSets"));
+    vkResetDescriptorPool = reinterpret_cast<PFN_vkResetDescriptorPool>(next(handle, "vkResetDescriptorPool"));
+    vkUpdateDescriptorSetWithTemplate = reinterpret_cast<PFN_vkUpdateDescriptorSetWithTemplate>(next(handle, "vkUpdateDescriptorSetWithTemplate"));
+    vkUpdateDescriptorSets = reinterpret_cast<PFN_vkUpdateDescriptorSets>(next(handle, "vkUpdateDescriptorSets"));
+    if (!vkCmdSetScissorWithCount) vkCmdSetScissorWithCount = reinterpret_cast<PFN_vkCmdSetScissorWithCount>(next(handle, "vkCmdSetScissorWithCountEXT"));
+    if (!vkCreateDescriptorUpdateTemplate) vkCreateDescriptorUpdateTemplate = reinterpret_cast<PFN_vkCreateDescriptorUpdateTemplate>(next(handle, "vkCreateDescriptorUpdateTemplateKHR"));
+    if (!vkDestroyDescriptorUpdateTemplate) vkDestroyDescriptorUpdateTemplate = reinterpret_cast<PFN_vkDestroyDescriptorUpdateTemplate>(next(handle, "vkDestroyDescriptorUpdateTemplateKHR"));
+    if (!vkUpdateDescriptorSetWithTemplate) vkUpdateDescriptorSetWithTemplate = reinterpret_cast<PFN_vkUpdateDescriptorSetWithTemplate>(next(handle, "vkUpdateDescriptorSetWithTemplateKHR"));
+
     vkCmdSetViewport = (PFN_vkCmdSetViewport)next(handle, "vkCmdSetViewport");
     vkCmdSetViewportWithCount = (PFN_vkCmdSetViewportWithCount)next(
         handle, "vkCmdSetViewportWithCount");
@@ -611,6 +662,7 @@ void reportSampled(Device *d, const Commands &parent, const SampledDraw &draw) {
   }
 }
 void propagate(Device *d) {
+  ++d->eyeGraphEpoch;
   for (auto &pair : d->images)
     if (!pair.second.registered) {
       pair.second.eyes = {};
@@ -810,10 +862,11 @@ Map *getMap(Device *d, const Image &image, const std::array<ffr::Rect, 2> &eyes,
     if (m.w == image.w && m.h == image.h && m.eyeCount == count &&
         m.layers == layers &&
         std::memcmp(m.eyes.data(), eyes.data(), sizeof(eyes)) == 0)
-      return !m.failed && m.submitted &&
-                     FN(d, vkGetFenceStatus)(d->handle, m.fence) == VK_SUCCESS
-                 ? &m
-                 : nullptr;
+    {
+      if (m.failed || !m.submitted) return nullptr;
+      if (!m.ready) m.ready = FN(d, vkGetFenceStatus)(d->handle, m.fence) == VK_SUCCESS;
+      return m.ready ? &m : nullptr;
+    }
   }
   if (d->maps.size() >= 32)
     return nullptr; // bounded device-lifetime resources
@@ -852,7 +905,7 @@ void submitMaps(Device *d, VkQueue queue) {
       if (r != VK_SUCCESS) d->enabled = false;
     }
 }
-bool sceneViewport(Device *d, const Commands &c) {
+bool computeSceneViewport(Device *d, const Commands &c) {
   auto it = d->images.find(c.color);
   if (it == d->images.end() || !c.viewportCount || c.viewportCount > 2)
     return false;
@@ -871,6 +924,20 @@ bool sceneViewport(Device *d, const Commands &c) {
         return true;
   }
   return false;
+}
+// Eye rectangles can change on the transport thread. The graph epoch and exact
+// viewport key invalidate cached qualification, including copied secondary state.
+bool sceneViewport(Device *d, const Commands &c) {
+  if (c.viewportCacheEpoch != d->eyeGraphEpoch || c.viewportCacheColor != c.color ||
+      c.viewportCacheCount != c.viewportCount ||
+      memcmp(c.viewportCacheViews.data(), c.viewports.data(), sizeof(c.viewports))) {
+    c.viewportCacheResult = computeSceneViewport(d, c);
+    c.viewportCacheEpoch = d->eyeGraphEpoch;
+    c.viewportCacheColor = c.color;
+    c.viewportCacheCount = c.viewportCount;
+    c.viewportCacheViews = c.viewports;
+  }
+  return c.viewportCacheResult;
 }
 // Secondary buffers are recorded before their target is known. Retain bounded
 // viewport batches, then qualify geometry against the actual parent attachment.
@@ -1374,6 +1441,7 @@ vkCreateImage(VkDevice h, const VkImageCreateInfo *ci,
                   (ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
                   colorFormat(ci->format);
     d->images[*out] = im;
+    ++d->eyeGraphEpoch;
   }
   return r;
 }
@@ -1531,24 +1599,28 @@ vkBeginCommandBuffer(VkCommandBuffer h, const VkCommandBufferBeginInfo *ci) {
 // Observe older render-pass paths without changing their commands or state.
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(
     VkCommandBuffer h, const VkRenderPassBeginInfo *ci, VkSubpassContents contents) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   if (d->debug && ++d->legacyCalls == 1) LOG("legacy render pass observed: FFR only handles dynamic rendering");
   auto fn = reinterpret_cast<PFN_vkCmdBeginRenderPass>(d->next(d->handle, "vkCmdBeginRenderPass"));
-  fn(h, ci, contents);
+  auto forward = fn;
+  guard.unlock();
+  forward(h, ci, contents);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass2(
     VkCommandBuffer h, const VkRenderPassBeginInfo *ci, const VkSubpassBeginInfo *begin) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   if (d->debug && ++d->legacyCalls == 1) LOG("legacy render pass2 observed: FFR only handles dynamic rendering");
   auto fn = reinterpret_cast<PFN_vkCmdBeginRenderPass2>(d->next(d->handle, "vkCmdBeginRenderPass2"));
   if (!fn) fn = reinterpret_cast<PFN_vkCmdBeginRenderPass2>(d->next(d->handle, "vkCmdBeginRenderPass2KHR"));
-  fn(h, ci, begin);
+  auto forward = fn;
+  guard.unlock();
+  forward(h, ci, begin);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL
 vkCmdBeginRendering(VkCommandBuffer h, const VkRenderingInfo *ci) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   auto &c = d->commands[h];
   if (d->debug) ++d->dynamicCalls;
@@ -1693,55 +1765,66 @@ vkCmdBeginRendering(VkCommandBuffer h, const VkRenderingInfo *ci) {
     }
   }
   if (d->debug && rejection && d->mode) rejectedPass(d, rejection, ci, c, candidate, &observed);
-  FN(d, vkCmdBeginRendering)(h, &info);
+  auto forward = FN(d, vkCmdBeginRendering);
+  guard.unlock();
+  forward(h, &info);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer h) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   finish(d, d->commands[h]);
-  FN(d, vkCmdEndRendering)(h);
+  auto forward = FN(d, vkCmdEndRendering);
+  guard.unlock();
+  forward(h);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetViewport(VkCommandBuffer h,
                                                    uint32_t first,
                                                    uint32_t count,
                                                    const VkViewport *views) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   auto &c = d->commands[h];
   c.viewportCount =
       first == 0 ? count : std::max(c.viewportCount, first + count);
   for (uint32_t i = 0; i < count && first + i < 2; i++)
     c.viewports[first + i] = views[i];
-  FN(d, vkCmdSetViewport)(h, first, count, views);
+  auto forward = FN(d, vkCmdSetViewport);
+  guard.unlock();
+  forward(h, first, count, views);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetViewportWithCount(
     VkCommandBuffer h, uint32_t count, const VkViewport *views) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   auto &c = d->commands[h];
   c.viewportCount = count;
   for (uint32_t i = 0; i < count && i < 2; i++)
     c.viewports[i] = views[i];
-  FN(d, vkCmdSetViewportWithCount)(h, count, views);
+  auto forward = FN(d, vkCmdSetViewportWithCount);
+  guard.unlock();
+  forward(h, count, views);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetScissor(VkCommandBuffer h, uint32_t first, uint32_t count, const VkRect2D *rects) {
-  std::lock_guard<std::recursive_mutex> guard(lock); auto d = dev(h); auto &c = d->commands[h];
+  std::unique_lock<std::recursive_mutex> guard(lock); auto d = dev(h); auto &c = d->commands[h];
   c.scissorCount = first == 0 ? count : std::max(c.scissorCount, first + count);
   for (unsigned j = 0; j < count && uint64_t(first) + j < c.scissors.size(); ++j) c.scissors[first+j] = rects[j];
-  reinterpret_cast<PFN_vkCmdSetScissor>(d->next(d->handle, "vkCmdSetScissor"))(h, first, count, rects);
+  auto forward = FN(d, vkCmdSetScissor);
+  guard.unlock();
+  forward(h, first, count, rects);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetScissorWithCount(VkCommandBuffer h, uint32_t count, const VkRect2D *rects) {
-  std::lock_guard<std::recursive_mutex> guard(lock); auto d = dev(h); auto &c = d->commands[h];
+  std::unique_lock<std::recursive_mutex> guard(lock); auto d = dev(h); auto &c = d->commands[h];
   c.scissorCount = count;
   for (unsigned j = 0; j < std::min(count, 2u); ++j) c.scissors[j] = rects[j];
-  auto fn = reinterpret_cast<PFN_vkCmdSetScissorWithCount>(d->next(d->handle, "vkCmdSetScissorWithCount"));
-  if (!fn) fn = reinterpret_cast<PFN_vkCmdSetScissorWithCount>(d->next(d->handle, "vkCmdSetScissorWithCountEXT"));
-  fn(h, count, rects);
+  auto fn = FN(d, vkCmdSetScissorWithCount);
+  auto forward = fn;
+  guard.unlock();
+  forward(h, count, rects);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDraw(VkCommandBuffer h, uint32_t n,
                                             uint32_t instances_, uint32_t first,
                                             uint32_t instance) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   auto &c = d->commands[h];
   if (d->debug) ++d->rawDraws;
@@ -1758,14 +1841,16 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDraw(VkCommandBuffer h, uint32_t n,
     if (sceneViewport(d, c)) { c.draws++; if (d->debug) d->qualifiedDraws++; }
     else if (d->debug) d->viewportRejects++;
   }
-  FN(d, vkCmdDraw)(h, n, instances_, first, instance);
+  auto forward = FN(d, vkCmdDraw);
+  guard.unlock();
+  forward(h, n, instances_, first, instance);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer h,
                                                    uint32_t n, uint32_t count,
                                                    uint32_t first,
                                                    int32_t offset,
                                                    uint32_t instance) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   auto &c = d->commands[h];
   if (d->debug) ++d->rawDraws;
@@ -1783,7 +1868,9 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer h,
     if (sceneViewport(d, c)) { c.draws++; c.indexed++; c.indexedVertices = std::min(c.indexedVertices + vertices, 1000000u); if (d->debug) d->qualifiedDraws++; }
     else if (d->debug) d->viewportRejects++;
   }
-  FN(d, vkCmdDrawIndexed)(h, n, count, first, offset, instance);
+  auto forward = FN(d, vkCmdDrawIndexed);
+  guard.unlock();
+  forward(h, n, count, first, offset, instance);
 }
 // GPU indirect buffers are never mapped or read back. For count-buffer draws,
 // maxDrawCount is only an upper bound: count one submission, not that maximum.
@@ -1808,63 +1895,79 @@ static void indirectDraw(Device *d, Commands &c, uint32_t count, bool indexed) {
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirect(VkCommandBuffer h, VkBuffer buffer,
     VkDeviceSize offset, uint32_t count, uint32_t stride) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   indirectDraw(d, d->commands[h], count, false);
-  FN(d, vkCmdDrawIndirect)(h, buffer, offset, count, stride);
+  auto forward = FN(d, vkCmdDrawIndirect);
+  guard.unlock();
+  forward(h, buffer, offset, count, stride);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirect(VkCommandBuffer h, VkBuffer buffer,
     VkDeviceSize offset, uint32_t count, uint32_t stride) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   indirectDraw(d, d->commands[h], count, true);
-  FN(d, vkCmdDrawIndexedIndirect)(h, buffer, offset, count, stride);
+  auto forward = FN(d, vkCmdDrawIndexedIndirect);
+  guard.unlock();
+  forward(h, buffer, offset, count, stride);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirectCount(VkCommandBuffer h, VkBuffer buffer,
     VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countOffset, uint32_t maximum, uint32_t stride) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   indirectDraw(d, d->commands[h], maximum ? 1u : 0u, false);
-  FN(d, vkCmdDrawIndirectCount)(h, buffer, offset, countBuffer, countOffset, maximum, stride);
+  auto forward = FN(d, vkCmdDrawIndirectCount);
+  guard.unlock();
+  forward(h, buffer, offset, countBuffer, countOffset, maximum, stride);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirectCountKHR(VkCommandBuffer h, VkBuffer buffer,
     VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countOffset, uint32_t maximum, uint32_t stride) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   indirectDraw(d, d->commands[h], maximum ? 1u : 0u, false);
-  FN(d, vkCmdDrawIndirectCountKHR)(h, buffer, offset, countBuffer, countOffset, maximum, stride);
+  auto forward = FN(d, vkCmdDrawIndirectCountKHR);
+  guard.unlock();
+  forward(h, buffer, offset, countBuffer, countOffset, maximum, stride);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirectCountAMD(VkCommandBuffer h, VkBuffer buffer,
     VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countOffset, uint32_t maximum, uint32_t stride) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   indirectDraw(d, d->commands[h], maximum ? 1u : 0u, false);
-  FN(d, vkCmdDrawIndirectCountAMD)(h, buffer, offset, countBuffer, countOffset, maximum, stride);
+  auto forward = FN(d, vkCmdDrawIndirectCountAMD);
+  guard.unlock();
+  forward(h, buffer, offset, countBuffer, countOffset, maximum, stride);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirectCount(VkCommandBuffer h, VkBuffer buffer,
     VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countOffset, uint32_t maximum, uint32_t stride) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   indirectDraw(d, d->commands[h], maximum ? 1u : 0u, true);
-  FN(d, vkCmdDrawIndexedIndirectCount)(h, buffer, offset, countBuffer, countOffset, maximum, stride);
+  auto forward = FN(d, vkCmdDrawIndexedIndirectCount);
+  guard.unlock();
+  forward(h, buffer, offset, countBuffer, countOffset, maximum, stride);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirectCountKHR(VkCommandBuffer h, VkBuffer buffer,
     VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countOffset, uint32_t maximum, uint32_t stride) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   indirectDraw(d, d->commands[h], maximum ? 1u : 0u, true);
-  FN(d, vkCmdDrawIndexedIndirectCountKHR)(h, buffer, offset, countBuffer, countOffset, maximum, stride);
+  auto forward = FN(d, vkCmdDrawIndexedIndirectCountKHR);
+  guard.unlock();
+  forward(h, buffer, offset, countBuffer, countOffset, maximum, stride);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirectCountAMD(VkCommandBuffer h, VkBuffer buffer,
     VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countOffset, uint32_t maximum, uint32_t stride) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   indirectDraw(d, d->commands[h], maximum ? 1u : 0u, true);
-  FN(d, vkCmdDrawIndexedIndirectCountAMD)(h, buffer, offset, countBuffer, countOffset, maximum, stride);
+  auto forward = FN(d, vkCmdDrawIndexedIndirectCountAMD);
+  guard.unlock();
+  forward(h, buffer, offset, countBuffer, countOffset, maximum, stride);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdExecuteCommands(
     VkCommandBuffer h, uint32_t count, const VkCommandBuffer *buffers) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   auto &parent = d->commands[h];
   if (sampledTracking(d) && parent.rendering) {
@@ -1945,13 +2048,15 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdExecuteCommands(
   // Never change child inheritance or the application's command list. The map
   // is attached to the parent at BeginRendering, using prior-pass evidence.
   auto fn = reinterpret_cast<PFN_vkCmdExecuteCommands>(d->next(d->handle, "vkCmdExecuteCommands"));
-  fn(h, count, buffers);
+  auto forward = fn;
+  guard.unlock();
+  forward(h, count, buffers);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer h, VkImage src,
                                                  VkImageLayout sl, VkImage dst,
                                                  VkImageLayout dl, uint32_t n,
                                                  const VkImageCopy *regions) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   for (unsigned i = 0; i < n; i++) {
     auto r = regions[i];
@@ -1960,12 +2065,14 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer h, VkImage src,
     edge(d, src, dst, r.extent.width, r.extent.height, r.srcOffset, r.dstOffset,
          r.srcSubresource.mipLevel, r.dstSubresource.mipLevel);
   }
-  FN(d, vkCmdCopyImage)(h, src, sl, dst, dl, n, regions);
+  auto forward = FN(d, vkCmdCopyImage);
+  guard.unlock();
+  forward(h, src, sl, dst, dl, n, regions);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL
 vkCmdResolveImage(VkCommandBuffer h, VkImage src, VkImageLayout sl, VkImage dst,
                   VkImageLayout dl, uint32_t n, const VkImageResolve *regions) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   for (unsigned i = 0; i < n; i++) {
     auto r = regions[i];
@@ -1974,11 +2081,13 @@ vkCmdResolveImage(VkCommandBuffer h, VkImage src, VkImageLayout sl, VkImage dst,
     edge(d, src, dst, r.extent.width, r.extent.height, r.srcOffset, r.dstOffset,
          r.srcSubresource.mipLevel, r.dstSubresource.mipLevel);
   }
-  FN(d, vkCmdResolveImage)(h, src, sl, dst, dl, n, regions);
+  auto forward = FN(d, vkCmdResolveImage);
+  guard.unlock();
+  forward(h, src, sl, dst, dl, n, regions);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage2(VkCommandBuffer h,
                                                   const VkCopyImageInfo2 *ci) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   for (unsigned i = 0; i < ci->regionCount; i++) {
     auto r = ci->pRegions[i];
@@ -1988,11 +2097,13 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage2(VkCommandBuffer h,
          r.srcOffset, r.dstOffset, r.srcSubresource.mipLevel,
          r.dstSubresource.mipLevel);
   }
-  FN(d, vkCmdCopyImage2)(h, ci);
+  auto forward = FN(d, vkCmdCopyImage2);
+  guard.unlock();
+  forward(h, ci);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL
 vkCmdResolveImage2(VkCommandBuffer h, const VkResolveImageInfo2 *ci) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   for (unsigned i = 0; i < ci->regionCount; i++) {
     auto r = ci->pRegions[i];
@@ -2002,7 +2113,9 @@ vkCmdResolveImage2(VkCommandBuffer h, const VkResolveImageInfo2 *ci) {
          r.srcOffset, r.dstOffset, r.srcSubresource.mipLevel,
          r.dstSubresource.mipLevel);
   }
-  FN(d, vkCmdResolveImage2)(h, ci);
+  auto forward = FN(d, vkCmdResolveImage2);
+  guard.unlock();
+  forward(h, ci);
 }
 namespace {
 // A flags2 structure overrides the legacy flags field. Copy the prefix through
@@ -2081,7 +2194,7 @@ EXPORT VKAPI_ATTR VkResult VKAPI_CALL
 vkCreateGraphicsPipelines(VkDevice h, VkPipelineCache cache, uint32_t n,
                           const VkGraphicsPipelineCreateInfo *ci,
                           const VkAllocationCallbacks *a, VkPipeline *out) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
   std::vector<VkGraphicsPipelineCreateInfo> copy(ci, ci + n);
   std::vector<std::unique_ptr<uint8_t[]>> chains;
@@ -2100,7 +2213,9 @@ vkCreateGraphicsPipelines(VkDevice h, VkPipelineCache cache, uint32_t n,
       p.flags |=
           VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT;
     }
-  return FN(d, vkCreateGraphicsPipelines)(h, cache, n, copy.data(), a, out);
+  auto forward = FN(d, vkCreateGraphicsPipelines);
+  guard.unlock();
+  return forward(h, cache, n, copy.data(), a, out);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue(VkDevice h, uint32_t family,
                                                    uint32_t index,
@@ -2121,18 +2236,22 @@ vkGetDeviceQueue2(VkDevice h, const VkDeviceQueueInfo2 *ci, VkQueue *out) {
 EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n,
                                                     const VkSubmitInfo *si,
                                                     VkFence f) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(q);
   submitMaps(d, q);
-  return FN(d, vkQueueSubmit)(q, n, si, f);
+  auto forward = FN(d, vkQueueSubmit);
+  guard.unlock();
+  return forward(q, n, si, f);
 }
 EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2(VkQueue q, uint32_t n,
                                                      const VkSubmitInfo2 *si,
                                                      VkFence f) {
-  std::lock_guard<std::recursive_mutex> guard(lock);
+  std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(q);
   submitMaps(d, q);
-  return FN(d, vkQueueSubmit2)(q, n, si, f);
+  auto forward = FN(d, vkQueueSubmit2);
+  guard.unlock();
+  return forward(q, n, si, f);
 }
 #include "descriptor_trace_hooks.inc"
 namespace {

@@ -1,5 +1,5 @@
 // Included by layer.cpp; these hooks observe descriptors and forward unchanged.
-#define DESCRIPTOR_NEXT(name) reinterpret_cast<PFN_##name>(d->next(d->handle, #name))
+#define DESCRIPTOR_NEXT(name) d->name
 EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice h, const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorSetLayout *out) {
   std::lock_guard<std::recursive_mutex> guard(lock); auto d = dev(h);
   auto result = DESCRIPTOR_NEXT(vkCreateDescriptorSetLayout)(h, ci, a, out);
@@ -68,7 +68,7 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDescriptorPool(VkDevice h, VkDescript
   forgetDescriptorPool(d, pool); DESCRIPTOR_NEXT(vkDestroyDescriptorPool)(h, pool, a);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice h, uint32_t nw, const VkWriteDescriptorSet *writes, uint32_t nc, const VkCopyDescriptorSet *copies) {
-  std::lock_guard<std::recursive_mutex> guard(lock); auto d = dev(h);
+  std::unique_lock<std::recursive_mutex> guard(lock); auto d = dev(h);
   if (sampledTracking(d)) {
     for (unsigned j = 0; j < nw; ++j) {
       const auto &w = writes[j]; auto i = d->descriptorSets.find(w.dstSet);
@@ -82,10 +82,12 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice h, uint32_t nw
       else descriptor_trace::copy(*src->second, *dst->second, c);
     }
   }
-  DESCRIPTOR_NEXT(vkUpdateDescriptorSets)(h, nw, writes, nc, copies);
+  auto forward = DESCRIPTOR_NEXT(vkUpdateDescriptorSets);
+  guard.unlock();
+  forward(h, nw, writes, nc, copies);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer h, VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t first, uint32_t count, const VkDescriptorSet *sets, uint32_t dynamicCount, const uint32_t *offsets) {
-  std::lock_guard<std::recursive_mutex> guard(lock); auto d = dev(h);
+  std::unique_lock<std::recursive_mutex> guard(lock); auto d = dev(h);
   if (sampledTracking(d) && point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
     auto &c = d->commands[h];
     // Conservatively drop previous bindings on any layout change. Missing
@@ -99,12 +101,13 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer h, VkP
       c.descriptorSets[first+j] = i == d->descriptorSets.end() ? nullptr : i->second;
     }
   }
-  DESCRIPTOR_NEXT(vkCmdBindDescriptorSets)(h, point, layout, first, count, sets, dynamicCount, offsets);
+  auto forward = DESCRIPTOR_NEXT(vkCmdBindDescriptorSets);
+  guard.unlock();
+  forward(h, point, layout, first, count, sets, dynamicCount, offsets);
 }
 EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorUpdateTemplate(VkDevice h, const VkDescriptorUpdateTemplateCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorUpdateTemplate *out) {
   std::lock_guard<std::recursive_mutex> guard(lock); auto d = dev(h);
   auto fn = DESCRIPTOR_NEXT(vkCreateDescriptorUpdateTemplate);
-  if (!fn) fn = reinterpret_cast<PFN_vkCreateDescriptorUpdateTemplate>(d->next(h, "vkCreateDescriptorUpdateTemplateKHR"));
   auto result = fn(h, ci, a, out);
   if (result == VK_SUCCESS && sampledTracking(d)) {
     auto &t = d->descriptorTemplates[*out]; t.type = ci->templateType; t.set = ci->set; t.bindPoint = ci->pipelineBindPoint;
@@ -121,19 +124,19 @@ EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorUpdateTemplate(VkDevice 
 EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDescriptorUpdateTemplate(VkDevice h, VkDescriptorUpdateTemplate t, const VkAllocationCallbacks *a) {
   std::lock_guard<std::recursive_mutex> guard(lock); auto d = dev(h); d->descriptorTemplates.erase(t);
   auto fn = DESCRIPTOR_NEXT(vkDestroyDescriptorUpdateTemplate);
-  if (!fn) fn = reinterpret_cast<PFN_vkDestroyDescriptorUpdateTemplate>(d->next(h, "vkDestroyDescriptorUpdateTemplateKHR"));
   fn(h, t, a);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevice h, VkDescriptorSet set, VkDescriptorUpdateTemplate t, const void *data) {
-  std::lock_guard<std::recursive_mutex> guard(lock); auto d = dev(h);
+  std::unique_lock<std::recursive_mutex> guard(lock); auto d = dev(h);
   auto i = d->descriptorSets.find(set); auto info = d->descriptorTemplates.find(t);
   if (sampledTracking(d) && i != d->descriptorSets.end()) {
     if (info != d->descriptorTemplates.end()) descriptor_trace::update(*i->second, info->second, data);
     else { i->second->valid = false; i->second->images.clear(); }
   }
   auto fn = DESCRIPTOR_NEXT(vkUpdateDescriptorSetWithTemplate);
-  if (!fn) fn = reinterpret_cast<PFN_vkUpdateDescriptorSetWithTemplate>(d->next(h, "vkUpdateDescriptorSetWithTemplateKHR"));
-  fn(h, set, t, data);
+  auto forward = fn;
+  guard.unlock();
+  forward(h, set, t, data);
 }
 static descriptor_trace::Set *pushState(Device *d, Commands &c, VkPipelineLayout layout, uint32_t set) {
   if (set >= c.descriptorSets.size()) return nullptr;
@@ -149,7 +152,7 @@ static descriptor_trace::Set *pushState(Device *d, Commands &c, VkPipelineLayout
   return state.get();
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetKHR(VkCommandBuffer h, VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t set, uint32_t count, const VkWriteDescriptorSet *writes) {
-  std::lock_guard<std::recursive_mutex> guard(lock); auto d = dev(h);
+  std::unique_lock<std::recursive_mutex> guard(lock); auto d = dev(h);
   if (sampledTracking(d) && point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
     auto state = pushState(d, d->commands[h], layout, set);
     if (state) for (unsigned j = 0; j < count; ++j) {
@@ -157,10 +160,12 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetKHR(VkCommandBuffer h, V
           w.descriptorType, w.pImageInfo, sizeof(VkDescriptorImageInfo));
     }
   }
-  DESCRIPTOR_NEXT(vkCmdPushDescriptorSetKHR)(h, point, layout, set, count, writes);
+  auto forward = DESCRIPTOR_NEXT(vkCmdPushDescriptorSetKHR);
+  guard.unlock();
+  forward(h, point, layout, set, count, writes);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplateKHR(VkCommandBuffer h, VkDescriptorUpdateTemplate t, VkPipelineLayout layout, uint32_t set, const void *data) {
-  std::lock_guard<std::recursive_mutex> guard(lock); auto d = dev(h);
+  std::unique_lock<std::recursive_mutex> guard(lock); auto d = dev(h);
   if (sampledTracking(d)) {
     auto info = d->descriptorTemplates.find(t);
     auto state = info != d->descriptorTemplates.end() && info->second.bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS
@@ -170,6 +175,8 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplateKHR(VkComman
       else { state->valid = false; state->images.clear(); }
     }
   }
-  DESCRIPTOR_NEXT(vkCmdPushDescriptorSetWithTemplateKHR)(h, t, layout, set, data);
+  auto forward = DESCRIPTOR_NEXT(vkCmdPushDescriptorSetWithTemplateKHR);
+  guard.unlock();
+  forward(h, t, layout, set, data);
 }
 #undef DESCRIPTOR_NEXT

@@ -2,6 +2,7 @@
 #include "../../app/src/main/cpp/vrffr/layer.cpp"
 #include <cassert>
 #include <iostream>
+#include <thread>
 namespace {
 struct FakeHandle {
   void *dispatch;
@@ -16,6 +17,18 @@ VkCommandBuffer command = reinterpret_cast<VkCommandBuffer>(&ch);
 bool extension = true, regular = true, reject = false, attached = false,
      patchedPipeline = false;
 unsigned creates = 0;
+bool verifyUnlocked = false;
+void checkForwardUnlocked() {
+  if (!verifyUnlocked) return;
+  bool acquired = false;
+  std::thread contender([&] { acquired = lock.try_lock(); if (acquired) lock.unlock(); });
+  contender.join();
+  assert(acquired); // Another thread can register eyes while driver work runs.
+}
+VkResult VKAPI_CALL fakeSubmitUnlocked(VkQueue, uint32_t, const VkSubmitInfo *, VkFence) {
+  checkForwardUnlocked(); return VK_SUCCESS;
+}
+
 VkResult VKAPI_CALL fakeCreate(VkPhysicalDevice, const VkDeviceCreateInfo *ci,
                                const VkAllocationCallbacks *, VkDevice *out) {
   creates++;
@@ -95,7 +108,7 @@ void VKAPI_CALL fakeBegin(VkCommandBuffer, const VkRenderingInfo *ci) {
 }
 void VKAPI_CALL fakeEnd(VkCommandBuffer) {}
 void VKAPI_CALL fakeDraw(VkCommandBuffer, uint32_t, uint32_t, uint32_t, int32_t,
-                         uint32_t) {}
+                         uint32_t) { checkForwardUnlocked(); }
 unsigned indirectForwarded = 0;
 void VKAPI_CALL fakeIndirect(VkCommandBuffer, VkBuffer buffer, VkDeviceSize offset,
                              uint32_t count, uint32_t stride) {
@@ -108,7 +121,9 @@ void VKAPI_CALL fakeIndirectCount(VkCommandBuffer, VkBuffer buffer, VkDeviceSize
   assert(counts == (VkBuffer)uintptr_t(98) && countOffset == 16 && maximum == 10000);
   ++indirectForwarded;
 }
-VkResult VKAPI_CALL fakeFence(VkDevice, VkFence) { return VK_SUCCESS; }
+unsigned fenceChecks = 0;
+VkResult fenceStatus = VK_SUCCESS;
+VkResult VKAPI_CALL fakeFence(VkDevice, VkFence) { ++fenceChecks; return fenceStatus; }
 VkResult VKAPI_CALL fakePipelines(VkDevice, VkPipelineCache, uint32_t n,
                                   const VkGraphicsPipelineCreateInfo *ci,
                                   const VkAllocationCallbacks *, VkPipeline *) {
@@ -298,6 +313,37 @@ void testRecurringPasses(Device *d, VkImage image, const VkRenderingInfo &ri) {
 }
 #define vkCmdBeginRendering beginWithHistoryFixture
 int main() {
+  // A completed immutable density map needs no further driver fence queries.
+  {
+    Device local;
+    local.vkGetFenceStatus = fakeFence;
+    Image image; image.w = image.h = 100;
+    std::array<ffr::Rect, 2> eyes{};
+    auto map = std::make_unique<Map>(); map->w = map->h = 100;
+    map->submitted = true;
+    local.maps.push_back(std::move(map));
+    fenceStatus = VK_NOT_READY;
+    assert(getMap(&local, image, eyes, 0, 1) == nullptr);
+    fenceStatus = VK_SUCCESS;
+    assert(getMap(&local, image, eyes, 0, 1));
+    const unsigned checked = fenceChecks;
+    assert(getMap(&local, image, eyes, 0, 1));
+    assert(fenceChecks == checked);
+
+    Commands c; c.color = (VkImage)uintptr_t(42); c.viewportCount = 1;
+    c.viewports[0] = {0,0,50,100,0,1}; local.images[c.color] = image;
+    assert(!sceneViewport(&local, c));
+    local.images[c.color].registered = true;
+    local.images[c.color].eyes[0] = {0,0,50,100}; local.images[c.color].eyeCount = 1;
+    propagate(&local);
+    assert(sceneViewport(&local, c)); // graph invalidation
+    c.viewports[0].width = 40;
+    assert(!sceneViewport(&local, c)); // viewport invalidation
+    c.viewports[0].width = 100;
+    assert(sceneViewport(&local, c));
+    c.color = (VkImage)uintptr_t(43);
+    assert(!sceneViewport(&local, c)); // target invalidation
+  }
   // RGBA16 normalized scene/resolve targets must remain eligible alongside
   // float color buffers. Depth and integer data textures are still excluded.
   assert(colorFormat(VK_FORMAT_R16G16B16A16_UNORM));
@@ -308,6 +354,11 @@ int main() {
   setenv("GN_VR_FFR_ENGINE", "unity", 1);
   auto d = setup();
   assert(d && d->enabled);
+  verifyUnlocked = true;
+  vkCmdDrawIndexed(command, 3, 1, 0, 0, 0);
+  d->vkQueueSubmit = fakeSubmitUnlocked;
+  assert(vkQueueSubmit(reinterpret_cast<VkQueue>(&ch), 0, nullptr, VK_NULL_HANDLE) == VK_SUCCESS);
+  verifyUnlocked = false;
   VkRenderPassBeginInfo legacyInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
   legacyInfo.renderArea.extent.width = 123;
   VkSubpassBeginInfo subpass{VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO};
@@ -807,7 +858,7 @@ int main() {
   vkCmdBindDescriptorSets(secondary, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
   vkCmdDrawIndexed(secondary, 6, 2, 0, 0, 0);
   assert(d->commands[secondary].sampledDraws.size() == 1);
-  assert(d->commands[secondary].sampledDraws[0].views == std::vector<VkImageView>{mrtView});
+  assert(d->commands[secondary].sampledDraws[0].views.size() == 1 && d->commands[secondary].sampledDraws[0].views[0] == mrtView);
   // A later descriptor update cannot rewrite the draw-recording snapshot.
   w.dstBinding = 0; w.descriptorCount = 1;
   vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
