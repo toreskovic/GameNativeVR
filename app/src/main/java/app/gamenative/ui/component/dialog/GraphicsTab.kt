@@ -232,7 +232,7 @@ fun GraphicsTabContent(state: ContainerConfigState, default: Boolean = false) {
                         colors = settingsTileColors(),
                         title = { Text(stringResource(R.string.xr_ffr_title)) },
                         value = config.xrFoveation.coerceIn(0, 2),
-                        items = listOf(stringResource(R.string.xr_upscaler_off),
+                        items = listOf(stringResource(R.string.xr_ffr_off),
                             stringResource(R.string.xr_ffr_conservative), stringResource(R.string.xr_ffr_aggressive)),
                         onItemSelected = { mode -> state.config.value = config.copy(xrFoveation = mode) },
                     )

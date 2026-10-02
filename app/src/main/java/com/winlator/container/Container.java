@@ -122,7 +122,7 @@ public class Container {
     private String box86Preset = Box86_64Preset.PERFORMANCE;
     private String box64Preset = Box86_64Preset.UNITY_MONO_BLEEDING_EDGE;
     private String fexcoreVersion = DefaultVersion.FEXCORE;
-    private String fexcorePreset = FEXCorePreset.COMPATIBILITY;
+    private String fexcorePreset = FEXCorePreset.INTERMEDIATE;
     private String emulator = DEFAULT_EMULATOR;
     private File rootDir;
     private String installPath = "";

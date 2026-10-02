@@ -972,7 +972,7 @@ object ContainerUtils {
                 dxwrapperConfig = dxvkConfig.toString(),
                 fexcoreVersion = DefaultVersion.FEXCORE,
                 box64Preset = Box86_64Preset.UNITY_MONO_BLEEDING_EDGE,
-                fexcorePreset = FEXCorePreset.COMPATIBILITY,
+                fexcorePreset = FEXCorePreset.INTERMEDIATE,
                 xrRenderScale = 70,
                 xrFoveation = 1, // Conservative
                 xrUpscaler = 2, // SGSR 1

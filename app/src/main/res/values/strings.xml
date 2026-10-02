@@ -2728,6 +2728,7 @@
     <string name="xr_force_disable_msaa">Force disable MSAA</string>
     <string name="xr_force_disable_msaa_desc">Disable multisample anti-aliasing for better VR performance. Applies to DXVK games after restarting.</string>
     <string name="xr_ffr_title">VR Fixed Foveated Rendering (experimental)</string>
+    <string name="xr_ffr_off">Off</string>
     <string name="xr_ffr_conservative">Conservative</string>
     <string name="xr_ffr_aggressive">Aggressive</string>
     <string name="xr_ffr_desc">Reduces peripheral detail in detected VR scene passes. Conservative requires an eye-image connection; Aggressive also guesses matching scene targets. Requires a compatible Vulkan driver and restarting the game. May cause visual artifacts.</string>
