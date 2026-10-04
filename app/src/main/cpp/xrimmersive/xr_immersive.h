@@ -17,7 +17,11 @@
 #include <GLES2/gl2ext.h>
 #include <android/hardware_buffer.h>
 
+#include "xr_visibility_mask.h"
 #include "xr_windows_projection.h"
+#include "xr_vulkan_context.h"
+#include "xr_vulkan_present.h"
+#include "xr_performance.h"
 #include "xr_windows_transport.h"
 
 #include <openxr/openxr.h>
@@ -103,20 +107,25 @@ struct WindowsRuntimeSnapshot {
 // Owns the OpenXR instance/session and its dedicated frame-loop thread.
 class XrImmersiveSession {
 public:
+    VisibilityMasks visibilityMasks;
     void configure(int32_t quadWidth, int32_t quadHeight, float refreshRate, int upscaler,
-                                     int32_t eyeWidth, int32_t eyeHeight, float sgsrSharpness, float fovScale, int fovBorder);
+                                     int32_t eyeWidth, int32_t eyeHeight, float sgsrSharpness, float fovScale, int fovBorder, bool fxaa, int ffrDebug);
     bool initialize(JavaVM *vm, jobject activityRef);
     void requestStop();
     void join();
 
     XrTime currentWindowsXrTime() const;
     bool locateWindowsViews(XrTime time, std::array<XrView, 2> *views, XrViewStateFlags *flags);
+    bool locateWindowsHand(XrTime time, uint32_t hand, bool aim,
+                           XrSpaceLocation *location, XrSpaceVelocity *velocity);
     InputSnapshot pollSnapshot();
     bool waitWindowsRuntimeSnapshot(uint64_t afterSerial, uint32_t timeoutMs,
-                                    WindowsRuntimeSnapshot *snapshot);
+                                    WindowsRuntimeSnapshot *snapshot, int64_t productionBudgetNs = -1);
     bool windowsStereoActive() const;
     bool applyWindowsHaptic(uint32_t hand, float amplitude, XrDuration duration, float frequency);
     void setWindowsOverlayVisible(bool visible);
+    void submitPerformanceBitmap(const uint8_t *pixels, int width, int height, int stride);
+    std::array<double,14> performanceSnapshot() { return vrPerformance.snapshot(); }
 
     // Called from the JNI bridge with a freshly PixelCopy'd RGBA_8888 frame of the game's
     // actual rendered output (see ImmersiveXrActivity's capture loop). Copies into a
@@ -150,6 +159,8 @@ public:
     void setSharedGameBuffer(AHardwareBuffer *buffer);
 
 private:
+    PFN_xrGetVisibilityMaskKHR getVisibilityMask_ = nullptr;
+    bool pico4VisibilityFallback_ = false;
     std::mutex windowsLocateMutex_;
     bool windowsViewsReady_ = false;
     void runLoop();
@@ -159,11 +170,17 @@ private:
     // Returns whether a swapchain image was acquired, rendered and released — false means the
     // caller must NOT submit a layer referencing it.
     bool renderFrame();
+    bool renderVulkanQuad();
+    XrResult endFrame(const XrFrameEndInfo*);
+    std::unique_ptr<XrVulkanContext> vulkan_;
+    std::unique_ptr<XrVulkanPresenter> vulkanQuad_;
+    uint64_t vulkanBitmapVersion_=0;
+
     void syncControllerInputs(XrTime predictedDisplayTime);
     void syncWindowsTrackingPoses(InputSnapshot *snapshot, XrTime predictedDisplayTime);
     void submitQuadLayer(XrTime predictedDisplayTime, XrSpace space, XrSwapchain swapchain,
                           int32_t width, int32_t height, bool sessionActive);
-    bool submitWindowsProjection(XrTime predictedDisplayTime);
+    bool submitWindowsProjection(XrTime predictedDisplayTime, XrDuration displayPeriod);
     void ensureQuadGeometryAndShader();
     void uploadPendingGameFrameLocked();
     void setupPassthrough();
@@ -184,6 +201,16 @@ private:
     bool localFloorExtensionAvailable_ = false;
     XrSpace windowsTrackingSpace_ = XR_NULL_HANDLE;
     XrSwapchain swapchain_ = XR_NULL_HANDLE;
+    bool renderPerformanceOverlay(XrCompositionLayerQuad &layer);
+    XrSwapchain performanceSwapchain_ = XR_NULL_HANDLE;
+    XrSpace performanceViewSpace_ = XR_NULL_HANDLE;
+    std::unique_ptr<XrVulkanPresenter> performancePresenter_;
+    VkFormat performanceFormat_{};
+    std::mutex performanceBitmapMutex_;
+    std::vector<uint8_t> performancePixels_;
+    uint64_t performanceVersion_=0, performanceRenderedVersion_=UINT64_MAX;
+    bool performanceFailed_=false;
+    VrPerformanceChord performanceChord_;
     XrSessionState sessionState_ = XR_SESSION_STATE_UNKNOWN;
     bool sessionRunning_ = false;
     windowsvr::WindowsFrameTransport windowsTransport_;
@@ -200,6 +227,8 @@ private:
     int32_t swapchainHeight_ = 720;
     float requestedRefreshRate_ = 72.0f;
     int upscaler_ = 0;
+    bool fxaa_ = true;
+    int ffrDebug_ = 0;
     float sgsrSharpness_ = 0.7f;
     float fovScale_ = 1.0f;
     int fovBorder_ = 0;
@@ -209,7 +238,6 @@ private:
     EGLDisplay eglDisplay_ = EGL_NO_DISPLAY;
     EGLContext eglContext_ = EGL_NO_CONTEXT;
     EGLSurface eglPbufferSurface_ = EGL_NO_SURFACE;
-    EGLConfig eglConfig_ = nullptr;
     GLuint framebuffer_ = 0;
     std::vector<XrSwapchainImageOpenGLESKHR> swapchainImages_;
 
@@ -318,6 +346,8 @@ private:
     std::mutex windowsSnapshotMutex_;
     std::condition_variable windowsSnapshotCondition_;
     WindowsRuntimeSnapshot windowsSnapshot_;
+    bool windowsFrameAdmissionOpen_ = false; // guarded by windowsSnapshotMutex_
+    XrTime windowsGuestTarget_ = 0;
 
     // Quad transform — defaults match the original hardcoded values (2m in front, 16:9,
     // 1.6m wide). Atomics: written from Kotlin/JNI callers, read from the render thread.
@@ -345,6 +375,9 @@ private:
     bool perfSettingsExtensionAvailable_ = false;
     bool threadSettingsExtensionAvailable_ = false;
     bool refreshRateExtensionAvailable_ = false;
+    PFN_xrGetDisplayRefreshRateFB getDisplayRefreshRate_ = nullptr;
+    int64_t performanceRefreshQueryAt_ = 0;
+    bool performanceRefreshKnown_ = false;
 
     std::atomic<bool> passthroughRequested_{false};
     bool passthroughActive_ = false;

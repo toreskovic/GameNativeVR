@@ -19,11 +19,11 @@ void test_entry(void) {
     PFN_xrEnumerateInstanceExtensionProperties enumerate;
     CHECK(get(XR_NULL_HANDLE,"xrEnumerateInstanceExtensionProperties",(PFN_xrVoidFunction*)&enumerate)==XR_SUCCESS);
     uint32_t count=0;
-    CHECK(enumerate(0,0,&count,0)==XR_SUCCESS && count==5);
-    XrExtensionProperties properties[5] = {{0}};
-    for (unsigned i=0;i<5;i++) properties[i].type=XR_TYPE_EXTENSION_PROPERTIES;
+    CHECK(enumerate(0,0,&count,0)==XR_SUCCESS && count==6);
+    XrExtensionProperties properties[6] = {{0}};
+    for (unsigned i=0;i<6;i++) properties[i].type=XR_TYPE_EXTENSION_PROPERTIES;
     CHECK(enumerate(0,4,&count,properties)==XR_ERROR_SIZE_INSUFFICIENT);
-    CHECK(enumerate(0,5,&count,properties)==XR_SUCCESS && properties[4].extensionVersion==1);
+    CHECK(enumerate(0,6,&count,properties)==XR_SUCCESS && properties[4].extensionVersion==1);
     PFN_xrCreateInstance create;
     CHECK(get(XR_NULL_HANDLE,"xrCreateInstance",(PFN_xrVoidFunction*)&create)==XR_SUCCESS);
     const char* extensions[]={"XR_KHR_win32_convert_performance_counter_time"};

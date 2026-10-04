@@ -38,11 +38,11 @@ for lib in ws2_32 kernel32 ntdll dxgi; do
 done
 
 # Release optimization; freestanding keeps our CRT-less memory helpers from recursing.
-"$bin/clang" --target=x86_64-w64-windows-gnu -shared -nostdlib -ffreestanding -O2 -Wl,-e,DllMain -I "$work/inc" \
+"$bin/clang" --target=x86_64-w64-windows-gnu -shared -nostdlib -ffreestanding -O2 -flto=thin -Wl,-e,DllMain -I "$work/inc" \
     -o "$output/gamenative_openxr_runtime64.dll" \
     "$source_dir/gamenative_openxr_runtime.c" "$source_dir/gamenative_openxr_runtime_x64.def" \
     "$work/libws2_32_x64.a" "$work/libkernel32_x64.a" "$work/libntdll_x64.a" "$work/libdxgi_x64.a"
-"$bin/clang" --target=i686-w64-windows-gnu -shared -nostdlib -ffreestanding -O2 -Wl,-e,DllMain -I "$work/inc" \
+"$bin/clang" --target=i686-w64-windows-gnu -shared -nostdlib -ffreestanding -O2 -flto=thin -Wl,-e,DllMain -I "$work/inc" \
     -o "$output/gamenative_openxr_runtime32.dll" \
     "$source_dir/gamenative_openxr_runtime.c" "$source_dir/gamenative_openxr_runtime_x86.def" \
     "$work/libws2_32_x86.a" "$work/libkernel32_x86.a" "$work/libntdll_x86.a" "$work/libdxgi_x86.a"

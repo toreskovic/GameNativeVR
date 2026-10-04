@@ -35,6 +35,9 @@ inline bool select(const Evidence &e, int mode) {
 }
 // Pixel coordinates are local to an attachment; separate rectangles avoid
 // placing a single high-quality region on the seam of packed stereo images.
+inline constexpr float kInnerRadius = .48f;
+inline constexpr float kOuterRadiusX = .8f;
+inline constexpr float kOuterRadiusY = 1.05f;
 inline uint8_t density(float x, float y, const Rect *eyes, unsigned count) {
   float r = 1000.f, outer = 1000.f;
   for (unsigned i = 0; i < count; i++) {
@@ -46,13 +49,15 @@ inline uint8_t density(float x, float y, const Rect *eyes, unsigned count) {
     r = std::min(r, std::sqrt(dx * dx + dy * dy));
     // Keep the full-rate ellipse unchanged, but bring 4x4 shading inward
     // horizontally: 80% of the half-width versus 105% of the half-height.
-    outer = std::min(outer, std::sqrt((dx / .8f) * (dx / .8f) +
-                                     (dy / 1.05f) * (dy / 1.05f)));
+    outer = std::min(outer, std::sqrt((dx / kOuterRadiusX) * (dx / kOuterRadiusX) +
+                                     (dy / kOuterRadiusY) * (dy / kOuterRadiusY)));
   }
-  if (r < .48f)
+  if (r < kInnerRadius)
     return 255;
+  // Round density downward in UNORM8 so the reciprocal is at least 2 or 4.
+  // 128/255 and 64/255 fall just short and can round to finer fragment sizes.
   if (outer < 1.f)
-    return 128;
-  return 64;
+    return 127;
+  return 63;
 }
 } // namespace ffr

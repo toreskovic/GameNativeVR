@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 project(gamenative_vrffr CXX)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 add_library(VkLayer_GN_vr_foveation SHARED layer.cpp)
 target_compile_features(VkLayer_GN_vr_foveation PRIVATE cxx_std_17)
 target_compile_options(VkLayer_GN_vr_foveation PRIVATE -Wall -Wextra -Werror -Wno-missing-field-initializers -fvisibility=hidden)

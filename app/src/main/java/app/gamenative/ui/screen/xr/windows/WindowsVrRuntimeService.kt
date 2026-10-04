@@ -80,6 +80,7 @@ class WindowsVrRuntimeService(context: Context) : Closeable {
         listOf("runtime.log", "unix.log").forEach { payload.prefixDirectory.resolve(it).delete() }
         env.put("XR_RUNTIME_JSON", active.runtimeManifest)
         env.put("GAMENATIVE_XR", "1")
+        env.put("GAMENATIVE_XR_PACKED_TRANSPORT", if (container.xrPackedTransport) "1" else "0")
         env.put("GAMENATIVE_XR_LOG", "1")
         env.put("GAMENATIVE_XR_SOCKET", active.transportEndpoint)
         env.put("GAMENATIVE_XR_BRIDGE_HOST", "127.0.0.1")

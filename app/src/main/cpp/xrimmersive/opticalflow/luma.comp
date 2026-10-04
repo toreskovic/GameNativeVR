@@ -1,0 +1,30 @@
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform sampler2D colorInput;
+layout(binding=1) uniform usampler2D lumaInput;
+#ifdef COMPACT_LUMA
+layout(binding=2,r8ui)
+#else
+layout(binding=2,r32ui)
+#endif
+writeonly uniform uimage2D outLuma;
+layout(push_constant) uniform Params { ivec4 size; } p;
+void main() {
+    ivec2 pos=ivec2(gl_GlobalInvocationID.xy), extent=imageSize(outLuma);
+    if(any(greaterThanEqual(pos,extent))) return;
+    float luma=0.0;
+    if(p.size.z==0) {
+        // Four bilinear taps reduce aliasing when flow inputs are downscaled.
+        vec2 uv=(vec2(pos)+0.5)/vec2(extent), d=0.25/vec2(extent);
+        vec3 c=textureLod(colorInput,uv+vec2(-d.x,-d.y),0).rgb+
+               textureLod(colorInput,uv+vec2(d.x,-d.y),0).rgb+
+               textureLod(colorInput,uv+vec2(-d.x,d.y),0).rgb+
+               textureLod(colorInput,uv+d,0).rgb;
+        luma=dot(c*0.25,vec3(0.2126,0.7152,0.0722))*255.0;
+    } else {
+        ivec2 hi=textureSize(lumaInput,0)-1;
+        for(int y=0;y<2;++y) for(int x=0;x<2;++x)
+            luma+=float(texelFetch(lumaInput,min(pos*2+ivec2(x,y),hi),0).r)*0.25;
+    }
+    imageStore(outLuma,pos,uvec4(uint(clamp(round(luma),0.0,255.0))));
+}

@@ -17,7 +17,11 @@ object XrNative {
     }
 
     /** Starts the OpenXR session on its own native thread. Returns an opaque session handle. */
-    external fun nativeCreate(activity: Context, quadWidth: Int, quadHeight: Int, refreshRate: Float, upscaler: Int, eyeWidth: Int, eyeHeight: Int, sgsrSharpness: Float, fovScale: Float, fovBorder: Int): Long
+    external fun nativeCreate(activity: Context, quadWidth: Int, quadHeight: Int, refreshRate: Float, upscaler: Int, eyeWidth: Int, eyeHeight: Int, sgsrSharpness: Float, fovScale: Float, fovBorder: Int, fxaa: Boolean, ffrDebug: Int): Long
+
+    /** One-second VR metrics with cached GPU pass timings; null if the session has ended. */
+    external fun nativePerformanceSnapshot(handle: Long): DoubleArray?
+    external fun nativeSubmitPerformanceBitmap(handle: Long, bitmap: Bitmap)
 
     /** Signals the native frame-loop thread to stop; does not block. */
     external fun nativeRequestStop(handle: Long)
@@ -45,14 +49,18 @@ object XrNative {
         outFlags: BooleanArray,
     ): Boolean
 
+    external fun nativeVisibilityMask(handle: Long, eye: Int, type: Int, offset: Int): String
+    external fun nativeVisibilityRevision(handle: Long): Int
     external fun nativeGetWindowsXrTime(handle: Long): Long
 
+    external fun nativeLocateWindowsHand(handle: Long, time: Long, hand: Int, aim: Boolean, pose: FloatArray, flags: IntArray): Boolean
     external fun nativeLocateWindowsViews(handle: Long, time: Long, views: FloatArray, flags: IntArray): Boolean
 
     external fun nativeWaitWindowsFrame(
         handle: Long,
         afterSerial: Long,
         timeoutMs: Int,
+        productionBudgetNs: Long,
         outTiming: LongArray,
         outViews: FloatArray,
         outInput: FloatArray,

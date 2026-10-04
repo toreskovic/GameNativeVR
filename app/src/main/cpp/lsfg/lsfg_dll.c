@@ -109,6 +109,7 @@ const uint32_t* lsfg_shader_ids(size_t* out_count) {
     return build_shader_ids(out_count);
 }
 
+#ifndef LSFG_CACHE_ONLY
 static uint64_t fnv1a64(const uint8_t* data, size_t size) {
     uint64_t hash = 1469598103934665603ULL;
     for (size_t i = 0; i < size; i++) {
@@ -658,6 +659,8 @@ LsfgStatus lsfg_cache_matches_source(const char* cache_path, const char* dll_pat
     pe_close(&image, fd, mapped_size);
     return LSFG_OK;
 }
+
+#endif // LSFG_CACHE_ONLY
 
 LsfgStatus lsfg_load_modules(const char* cache_path, LsfgModuleSet* out_set) {
     if (!cache_path || !out_set) return LSFG_CACHE_UNUSABLE;

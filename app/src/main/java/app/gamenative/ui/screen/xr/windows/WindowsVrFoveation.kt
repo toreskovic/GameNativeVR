@@ -19,6 +19,7 @@ object WindowsVrFoveation {
         env.put("VK_INSTANCE_LAYERS", layers.joinToString(":"))
         env.remove("GN_VR_FFR_LIBRARY")
         env.put("GN_VR_FFR", "0")
+        env.put("GN_VR_FFR_TILE_PREVIEW", if (container.xrFfrDebug == 1) "1" else "0")
         val mode = container.xrFoveation.coerceIn(0, 2)
         if (mode == 0) return "Off"
         val library = File(context.applicationInfo.nativeLibraryDir, "libVkLayer_GN_vr_foveation.so")

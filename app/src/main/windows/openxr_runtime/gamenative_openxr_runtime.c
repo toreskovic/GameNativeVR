@@ -1304,7 +1304,7 @@ static int gn_bridge_frame_sync(char* frame_out, gn_size frame_size) {
         char bundle[2048];
         if (gn_unix_control_transact("FRAME_SYNC", 4, bundle, sizeof(bundle))) {
             const char* cursor = bundle;
-            char first[192];
+            char first[256];
             if (gn_split_line(&cursor, first, sizeof(first)) &&
                 gn_starts_with(first, "OK")) {
                 gn_copy(frame_out, frame_size, first);
@@ -1316,7 +1316,7 @@ static int gn_bridge_frame_sync(char* frame_out, gn_size frame_size) {
                 return 1;
             }
             gn_copy(frame_out, frame_size, first);
-            if (gn_starts_with(first, "ERROR")) {
+            if (gn_starts_with(first, "ERROR unknown") || gn_starts_with(first, "ERROR malformed")) {
                 gn_frame_sync_supported = 0;
                 gn_log_line("FRAME_SYNC unsupported by bridge; using separate per-frame requests");
             }
@@ -1330,7 +1330,7 @@ static int gn_bridge_frame_sync(char* frame_out, gn_size frame_size) {
             gn_bridge_read_line_locked(gn_cached_views, sizeof(gn_cached_views)) &&
             gn_bridge_read_line_locked(gn_cached_input[0], sizeof(gn_cached_input[0])) &&
             gn_bridge_read_line_locked(gn_cached_input[1], sizeof(gn_cached_input[1]));
-    } else if (gn_starts_with(frame_out, "ERROR")) {
+    } else if (gn_starts_with(frame_out, "ERROR unknown") || gn_starts_with(frame_out, "ERROR malformed")) {
         gn_frame_sync_supported = 0;
         gn_log_line("FRAME_SYNC unsupported by bridge; using separate per-frame requests");
     }
@@ -1624,11 +1624,12 @@ static XrResult XRAPI_CALL gn_xrEnumerateInstanceExtensionProperties(
     gn_uint32* propertyCountOutput,
     XrExtensionProperties* properties) {
     (void)layerName;
-    const gn_uint32 available = 5;
+    const gn_uint32 available = 6;
     if (!propertyCountOutput) return XR_ERROR_VALIDATION_FAILURE;
     if (propertyCapacityInput != 0 && properties == NULL) return XR_ERROR_VALIDATION_FAILURE;
     XrResult r = gn_copy_props(available, propertyCapacityInput, propertyCountOutput);
     if (XR_FAILED(r) || propertyCapacityInput == 0) return r;
+    gn_write_extension(&properties[5], XR_KHR_VISIBILITY_MASK_EXTENSION_NAME, XR_KHR_visibility_mask_SPEC_VERSION);
     gn_write_extension(&properties[0], XR_KHR_D3D11_ENABLE_EXTENSION_NAME, XR_KHR_D3D11_enable_SPEC_VERSION);
     if (propertyCapacityInput > 1) {
         gn_write_extension(&properties[1], XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_vulkan_enable_SPEC_VERSION);
@@ -1648,6 +1649,9 @@ static XrResult XRAPI_CALL gn_xrEnumerateInstanceExtensionProperties(
 static volatile int gn_clock_lock = 0;
 static int gn_clock_ready = 0;
 static int gn_clock_enabled = 0;
+static int gn_visibility_enabled = 0;
+static long long gn_visibility_revision = -1;
+static unsigned gn_visibility_events = 0;
 static GnXrClock gn_clock;
 
 // Calibrate against an actual headset XrTime, never a predicted future frame time.
@@ -1710,6 +1714,7 @@ static XrResult XRAPI_CALL gn_xrCreateInstance(const XrInstanceCreateInfo* creat
     if (!instance) return XR_ERROR_VALIDATION_FAILURE;
     gn_clock_ready = 0;
     gn_clock_enabled = 0;
+    gn_visibility_enabled = 0; gn_visibility_revision = -1; gn_visibility_events = 0;
     gn_clear_events();
     gn_session_running = 0;
     gn_stopping_pushed = 0;
@@ -1728,6 +1733,7 @@ static XrResult XRAPI_CALL gn_xrCreateInstance(const XrInstanceCreateInfo* creat
         for (gn_uint32 i = 0; i < createInfo->enabledExtensionCount; ++i) {
             gn_log2("  enabled extension: ", createInfo->enabledExtensionNames[i]);
             if (gn_streq(createInfo->enabledExtensionNames[i], GN_WIN32_TIME_EXTENSION)) gn_clock_enabled = 1;
+            if (gn_streq(createInfo->enabledExtensionNames[i], XR_KHR_VISIBILITY_MASK_EXTENSION_NAME)) gn_visibility_enabled = 1;
         }
     }
     gn_bridge_call("HELLO", NULL, 0);
@@ -1745,6 +1751,61 @@ static XrResult XRAPI_CALL gn_xrDestroyInstance(XrInstance instance) {
     return XR_SUCCESS;
 }
 
+// Forward tangent-plane geometry unchanged: applications project it with their
+// own FOV. Chunk revisions prevent mixing geometry across runtime mask updates.
+static int gn_visibility_chunk(unsigned eye,unsigned type,unsigned offset,char *out,gn_size capacity) {
+    char request[96];
+    gn_size n=gn_append(request,sizeof(request),0,"GET_VISIBILITY_MASK ");
+    n=gn_append_i64(request,sizeof(request),n,eye);n=gn_append(request,sizeof(request),n," ");
+    n=gn_append_i64(request,sizeof(request),n,type);n=gn_append(request,sizeof(request),n," ");
+    gn_append_i64(request,sizeof(request),n,offset);
+    return gn_bridge_call(request,out,capacity);
+}
+static XrResult XRAPI_CALL gn_xrGetVisibilityMaskKHR(XrSession session,XrViewConfigurationType viewType,
+    gn_uint32 viewIndex,XrVisibilityMaskTypeKHR type,XrVisibilityMaskKHR *mask) {
+    if(session!=gn_session) return XR_ERROR_HANDLE_INVALID;
+    if(!gn_visibility_enabled) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    if(viewType!=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    if(viewIndex>=2) return XR_ERROR_INDEX_OUT_OF_RANGE;
+    if(type<1 || type>3 || !mask || mask->type!=XR_TYPE_VISIBILITY_MASK_KHR)
+        return XR_ERROR_VALIDATION_FAILURE;
+    if((mask->vertexCapacityInput && !mask->vertices)||(mask->indexCapacityInput && !mask->indices))
+        return XR_ERROR_VALIDATION_FAILURE;
+    char response[2048];
+    for(unsigned attempt=0;attempt<3;++attempt) {
+        mask->vertexCountOutput=mask->indexCountOutput=0;
+        if(!gn_visibility_chunk(viewIndex,type,0,response,sizeof(response))) return XR_ERROR_RUNTIME_FAILURE;
+        long long revision=gn_parse_i64(response,"revision",-1);
+        long long vc=gn_parse_i64(response,"vertices",-1),ic=gn_parse_i64(response,"indices",-1);
+        if(revision<0||vc<0||ic<0||vc>65536||ic>196608) return XR_ERROR_RUNTIME_FAILURE;
+        if(gn_visibility_revision<0) gn_visibility_revision=revision;
+        mask->vertexCountOutput=(gn_uint32)vc;mask->indexCountOutput=(gn_uint32)ic;
+        if(!mask->vertexCapacityInput || !mask->indexCapacityInput) return XR_SUCCESS;
+        if(mask->vertexCapacityInput<vc || mask->indexCapacityInput<ic) return XR_ERROR_SIZE_INSUFFICIENT;
+        unsigned total=(unsigned)(vc*2+ic),offset=0;
+        for(;offset<total;offset+=64) {
+            if(offset && !gn_visibility_chunk(viewIndex,type,offset,response,sizeof(response))) return XR_ERROR_RUNTIME_FAILURE;
+            if(gn_parse_i64(response,"revision",-1)!=revision) break;
+            for(unsigned j=0;j<64&&offset+j<total;++j) {
+                char key[16];gn_size n=gn_append(key,sizeof(key),0,"v");gn_append_i64(key,sizeof(key),n,j);
+                long long value=gn_parse_i64(response,key,GN_PARSE_MISSING);
+                if(value==GN_PARSE_MISSING) return XR_ERROR_RUNTIME_FAILURE;
+                unsigned index=offset+j;
+                if(index<(unsigned)vc*2) {
+                    if(value<-100000000||value>100000000) return XR_ERROR_RUNTIME_FAILURE;
+                    if(index&1) mask->vertices[index/2].y=(float)value/1000000.f;
+                    else mask->vertices[index/2].x=(float)value/1000000.f;
+                } else {
+                    if(value<0||value>=vc) return XR_ERROR_RUNTIME_FAILURE;
+                    mask->indices[index-(unsigned)vc*2]=(gn_uint32)value;
+                }
+            }
+        }
+        if(offset>=total) return XR_SUCCESS;
+    }
+    return XR_ERROR_RUNTIME_FAILURE;
+}
+
 static XrResult XRAPI_CALL gn_xrGetInstanceProperties(XrInstance instance, XrInstanceProperties* properties) {
     (void)instance;
     if (!properties) return XR_ERROR_VALIDATION_FAILURE;
@@ -1757,6 +1818,14 @@ static XrResult XRAPI_CALL gn_xrPollEvent(XrInstance instance, XrEventDataBuffer
     XrSessionState state;
     if (instance != gn_instance) return XR_ERROR_HANDLE_INVALID;
     if (!eventData) return XR_ERROR_VALIDATION_FAILURE;
+    if (gn_visibility_enabled && gn_visibility_events) {
+        XrEventDataVisibilityMaskChangedKHR *changed=(XrEventDataVisibilityMaskChangedKHR*)eventData;
+        changed->type=XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR; changed->next=NULL;
+        changed->session=gn_session; changed->viewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        changed->viewIndex=(gn_visibility_events&1)?0:1;
+        gn_visibility_events &= ~(1u<<changed->viewIndex);
+        return XR_SUCCESS;
+    }
     if (gn_events_lost != 0) {
         XrEventDataEventsLost* lost = (XrEventDataEventsLost*)eventData;
         lost->type = XR_TYPE_EVENT_DATA_EVENTS_LOST;
@@ -2340,6 +2409,58 @@ static XrResult gn_refresh_views_at(XrTime time, XrViewStateFlags *flags) {
     return XR_SUCCESS;
 }
 
+// Locate controller action spaces at the caller's prediction time. Do not write
+// gn_hands or the FRAME_SYNC cache: action/button state must remain synchronized
+// to xrSyncActions even when a game asks for several late tracking updates.
+static int gn_space_pose_at(XrSpace space, XrTime time, XrPosef *pose,
+                            float linear[3], float angular[3],
+                            XrSpaceLocationFlags *flags, XrSpaceVelocityFlags *velocity_flags) {
+    int idx = gn_action_space_index(space);
+    if (idx < 0) return gn_space_absolute_pose(space, pose, linear, angular);
+    const GnActionSpace *action_space = &gn_action_spaces[idx];
+    const GnAction *action = &gn_actions[action_space->action_idx];
+    int hand = action_space->hand >= 0 ? action_space->hand : gn_action_default_hand(action);
+    gn_identity_pose(pose);
+    for (int i = 0; i < 3; ++i) linear[i] = angular[i] = 0.0f;
+    *flags = 0;
+    *velocity_flags = 0;
+    if ((action->active_hands & (1u << hand)) == 0) return 0;
+    char request[128], response[512];
+    gn_size len = gn_append(request, sizeof(request), 0, "LOCATE_HAND time=");
+    len = gn_append_i64(request, sizeof(request), len, time);
+    len = gn_append(request, sizeof(request), len, hand ? " hand=1" : " hand=0");
+    gn_append(request, sizeof(request), len,
+        action->component[hand] == GN_COMP_AIM_POSE ? " aim=1" : " aim=0");
+    if (!gn_bridge_call(request, response, sizeof(response))) return -2;
+    float raw[7];
+    const char *keys[7] = {"qx", "qy", "qz", "qw", "px", "py", "pz"};
+    for (int i = 0; i < 7; ++i) raw[i] = gn_parse_micro(response, keys[i], i == 3 ? 1.0f : 0.0f);
+    XrPosef tracked;
+    gn_write_pose(&tracked, raw);
+    *pose = gn_pose_multiply(tracked, action_space->pose_in_action_space);
+    *flags = (XrSpaceLocationFlags)gn_parse_i64(response, "flags", 0);
+    *velocity_flags = (XrSpaceVelocityFlags)gn_parse_i64(response, "velocityFlags", 0);
+    const char *lv[3] = {"vx", "vy", "vz"}, *av[3] = {"wx", "wy", "wz"};
+    for (int i = 0; i < 3; ++i) {
+        linear[i] = gn_parse_micro(response, lv[i], 0.0f);
+        angular[i] = gn_parse_micro(response, av[i], 0.0f);
+    }
+    // The native velocity is measured at the tracked origin, not at the game's
+    // optional action-space offset. v(offset) = v(origin) + omega cross offset.
+    XrVector3f offset = gn_quat_rotate(tracked.orientation, action_space->pose_in_action_space.position);
+    if (offset.x != 0 || offset.y != 0 || offset.z != 0) {
+        if ((*velocity_flags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) &&
+            (*flags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+            linear[0] += angular[1] * offset.z - angular[2] * offset.y;
+            linear[1] += angular[2] * offset.x - angular[0] * offset.z;
+            linear[2] += angular[0] * offset.y - angular[1] * offset.x;
+        } else *velocity_flags &= ~XR_SPACE_VELOCITY_LINEAR_VALID_BIT;
+        if (!(*flags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
+            *flags &= ~(XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT);
+    }
+    return 1;
+}
+
 static XrResult XRAPI_CALL gn_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation* location) {
     if (time <= 0) return XR_ERROR_TIME_INVALID;
     XrViewStateFlags head_flags = XR_VIEW_STATE_ORIENTATION_VALID_BIT |
@@ -2358,8 +2479,19 @@ static XrResult XRAPI_CALL gn_xrLocateSpace(XrSpace space, XrSpace baseSpace, Xr
     float linear[3], angular[3], base_linear[3], base_angular[3];
     if (!location) return XR_ERROR_VALIDATION_FAILURE;
 
-    int space_status = gn_space_absolute_pose(space, &absolute_pose, linear, angular);
-    int base_status = gn_space_absolute_pose(baseSpace, &base_pose, base_linear, base_angular);
+    XrSpaceLocationFlags space_flags = (XrSpaceLocationFlags)head_flags, base_flags = space_flags;
+    XrSpaceVelocityFlags space_velocity_flags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+    XrSpaceVelocityFlags base_velocity_flags = space_velocity_flags;
+    int space_status = gn_space_pose_at(space, time, &absolute_pose, linear, angular, &space_flags, &space_velocity_flags);
+    int base_status;
+    if (baseSpace == space) {
+        base_status = space_status;
+        base_pose = absolute_pose;
+        base_flags = space_flags;
+        base_velocity_flags = space_velocity_flags;
+        for (int i = 0; i < 3; ++i) { base_linear[i] = linear[i]; base_angular[i] = angular[i]; }
+    } else base_status = gn_space_pose_at(baseSpace, time, &base_pose, base_linear, base_angular, &base_flags, &base_velocity_flags);
+    if (space_status == -2 || base_status == -2) return XR_ERROR_RUNTIME_FAILURE;
     if (space_status < 0 || base_status < 0) return XR_ERROR_HANDLE_INVALID;
 
     if (location->next) {
@@ -2386,8 +2518,8 @@ static XrResult XRAPI_CALL gn_xrLocateSpace(XrSpace space, XrSpace baseSpace, Xr
                 };
                 velocity->linearVelocity = gn_quat_rotate(base_inverse, relative_linear);
                 velocity->angularVelocity = gn_quat_rotate(base_inverse, relative_angular);
-                velocity->velocityFlags =
-                    XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+                velocity->velocityFlags = space_velocity_flags & base_velocity_flags;
+                if (!(base_flags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) velocity->velocityFlags = 0;
             }
         }
     }
@@ -2397,10 +2529,7 @@ static XrResult XRAPI_CALL gn_xrLocateSpace(XrSpace space, XrSpace baseSpace, Xr
     if (space_status == 0 || base_status == 0) return XR_SUCCESS;
     location->pose = gn_pose_multiply(gn_pose_inverse(base_pose), absolute_pose);
     location->locationFlags = 0;
-    if (head_flags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) location->locationFlags |= XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
-    if (head_flags & XR_VIEW_STATE_POSITION_VALID_BIT) location->locationFlags |= XR_SPACE_LOCATION_POSITION_VALID_BIT;
-    if (head_flags & XR_VIEW_STATE_ORIENTATION_TRACKED_BIT) location->locationFlags |= XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
-    if (head_flags & XR_VIEW_STATE_POSITION_TRACKED_BIT) location->locationFlags |= XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+    location->locationFlags = space_flags & base_flags;
     return XR_SUCCESS;
 }
 
@@ -2475,18 +2604,24 @@ static XrResult XRAPI_CALL gn_xrLocateSpaces(
 
 static XrResult XRAPI_CALL gn_xrWaitFrame(XrSession session, const XrFrameWaitInfo* waitInfo, XrFrameState* frameState) {
     (void)waitInfo;
-    char response[160];
+    char response[256] = {0};
     int synced;
     if (session != gn_session || !frameState) return XR_ERROR_HANDLE_INVALID;
     synced = gn_frame_sync_supported && gn_bridge_frame_sync(response, sizeof(response));
     if (!synced && !gn_frame_sync_supported)
         synced = gn_bridge_call("WAIT_FRAME", response, sizeof(response));
+    if (!synced && gn_starts_with(response, "ERROR gpu_")) return XR_ERROR_RUNTIME_FAILURE;
     if (synced) {
         frameState->predictedDisplayTime = gn_parse_i64(response, "time", gn_next_display_time);
         frameState->predictedDisplayPeriod = gn_parse_i64(response, "period", 11111111);
         frameState->shouldRender = gn_parse_i64(response, "render", gn_session_running ? 1 : 0) != 0 ? XR_TRUE : XR_FALSE;
         gn_next_display_time = frameState->predictedDisplayTime + frameState->predictedDisplayPeriod;
 
+        long long mask_revision=gn_parse_i64(response,"maskRevision",-1);
+        if(mask_revision>=0) {
+            if(gn_visibility_revision>=0 && mask_revision!=gn_visibility_revision) gn_visibility_events|=3;
+            gn_visibility_revision=mask_revision;
+        }
         long long recenter_serial = gn_parse_i64(response, "recenter", -1);
         if (recenter_serial >= 0) {
             gn_recenter_serial_supported = 1;
@@ -2574,6 +2709,13 @@ static XrResult XRAPI_CALL gn_xrEndFrame(XrSession session, const XrFrameEndInfo
     }
 
     int submission_failed = 0;
+    // Wait before flushing/locking DXVK or vkd3d. The worker must be able to
+    // retire already-submitted work; never sleep while holding the game queue.
+    if (frameEndInfo->layerCount) {
+        char admission[64];
+        if (gn_unix_control_transact("SUBMIT_BUDGET", 1, admission, sizeof(admission)) &&
+            gn_starts_with(admission, "ERROR gpu_")) return XR_ERROR_RUNTIME_FAILURE;
+    }
     if (gn_gfx_api == GN_GFX_D3D11) gn_dxvk_flush_and_lock();
     if (gn_gfx_api == GN_GFX_D3D12) gn_vkd3d_lock();
     for (gn_uint32 layer_index = 0;
@@ -2766,8 +2908,9 @@ static XrResult XRAPI_CALL gn_xrEnumerateSwapchainFormats(XrSession session, gn_
 
 
 
-    static const int64_t vk_formats[] = {50                  , 44                   , 43                  , 37                   };
-    static const int64_t d3d_formats[] = {91                             , 87                   , 29                        , 28                   };
+    /* Prefer AHB-compatible channel order without changing the game's gamma encoding. */
+    static const int64_t vk_formats[] = {43 /* RGBA sRGB */, 50 /* BGRA sRGB */, 37 /* RGBA UNORM */, 44 /* BGRA UNORM */};
+    static const int64_t d3d_formats[] = {29 /* RGBA sRGB */, 91 /* BGRA sRGB */, 28 /* RGBA UNORM */, 87 /* BGRA UNORM */};
     const int64_t* list =
         (gn_gfx_api == GN_GFX_D3D11 || gn_gfx_api == GN_GFX_D3D12) ?
         d3d_formats : vk_formats;
@@ -3563,6 +3706,9 @@ GN_EXPORT XrResult XRAPI_CALL xrGetInstanceProcAddr(XrInstance instance, const c
     *function = NULL;
 #define GN_PROC(n) if (gn_streq(name, #n)) { *function = (PFN_xrVoidFunction)gn_##n; return XR_SUCCESS; }
     GN_PROC(xrEnumerateInstanceExtensionProperties)
+    if(gn_visibility_enabled && instance==gn_instance) {
+        GN_PROC(xrGetVisibilityMaskKHR)
+    }
     if (gn_clock_enabled && instance == gn_instance) {
         GN_PROC(xrConvertWin32PerformanceCounterToTimeKHR)
         GN_PROC(xrConvertTimeToWin32PerformanceCounterKHR)

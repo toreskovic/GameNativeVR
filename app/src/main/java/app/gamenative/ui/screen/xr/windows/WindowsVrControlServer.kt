@@ -89,10 +89,24 @@ class WindowsVrControlServer(
                 if (time > 0L) "OK time=$time" else "ERROR clock_unavailable"
             } else "ERROR malformed"
             "GET_SYSTEM" -> if (tokens.size == 1) "OK system=1 vendor=2833 name=Meta_Quest_GameNative" else "ERROR malformed"
+            "GET_VISIBILITY_MASK" -> {
+                val values = tokens.drop(1).map { it.toIntOrNull() }
+                if(values.size != 3 || values.any { it == null } || values[0] !in 0..1 ||
+                    values[1] !in 1..3 || values[2] !in 0..327680) "ERROR malformed"
+                else snapshots.visibilityMask(values[0]!!, values[1]!!, values[2]!!)
+            }
             "GET_VIEWS" -> if (tokens.size == 1) getViews() else "ERROR malformed"
             "GET_BOUNDS" -> if (tokens.size == 1) getBounds() else "ERROR malformed"
-            "WAIT_FRAME" -> if (tokens.size == 1) waitFrame() else "ERROR malformed"
-            "FRAME_SYNC" -> if (tokens.size == 1) frameSync() else "ERROR malformed"
+            "WAIT_FRAME", "FRAME_SYNC" -> {
+                val budget = when {
+                    tokens.size == 1 -> 0L
+                    tokens.size == 2 && tokens[1].startsWith("budget=") ->
+                        tokens[1].substringAfter("=").toLongOrNull()
+                    else -> null
+                }
+                if (budget == null || budget !in 0L..100_000_000L) "ERROR malformed"
+                else if (tokens[0] == "FRAME_SYNC") frameSync(budget) else waitFrame(budget)
+            }
             "LOCATE_VIEWS" -> when {
                 tokens.size == 1 -> locateViews()
                 tokens.size == 2 && tokens[1].startsWith("time=") -> {
@@ -101,6 +115,7 @@ class WindowsVrControlServer(
                 }
                 else -> "ERROR malformed"
             }
+            "LOCATE_HAND" -> locateHand(tokens)
             "GET_INPUT" -> getInput(tokens)
             "HAPTIC" -> haptic(tokens)
             "BEGIN_SESSION" -> if (tokens.size == 1) {
@@ -160,9 +175,9 @@ class WindowsVrControlServer(
 
     private var handlerMs = 0L
 
-    private fun frameSync(): String {
+    private fun frameSync(productionBudgetNs: Long = 0): String {
         val handlerStart = System.nanoTime()
-        val frame = waitFrame()
+        val frame = waitFrame(productionBudgetNs)
         if (!frame.startsWith("OK")) return frame
         handlerMs += (System.nanoTime() - handlerStart) / 1_000_000
         val now = System.currentTimeMillis()
@@ -184,8 +199,8 @@ class WindowsVrControlServer(
             getInput(listOf("GET_INPUT", "hand=1"))
     }
 
-    private fun waitFrame(): String {
-        val snapshot = snapshots.waitFrame(lastFrameSerial, 1000) ?: return "ERROR timeout"
+    private fun waitFrame(productionBudgetNs: Long = 0): String {
+        val snapshot = snapshots.waitFrame(lastFrameSerial, 1000, productionBudgetNs) ?: return "ERROR timeout"
         lastFrameSerial = snapshot.timing[0]
         if (!trackingSpaceRecorded) {
             trackingSpaceRecorded = true
@@ -195,7 +210,7 @@ class WindowsVrControlServer(
                     "bounds=${if (snapshot.timing[7] != 0L) "${snapshot.timing[8]}x${snapshot.timing[9]}um" else "unavailable"}",
             )
         }
-        return "OK serial=${snapshot.timing[0]} time=${snapshot.timing[1]} period=${snapshot.timing[2]} shouldRender=${snapshot.timing[4]} state=${snapshot.timing[3]} render=${snapshot.timing[4]} recenter=${snapshot.timing[11]}"
+        return "OK serial=${snapshot.timing[0]} time=${snapshot.timing[1]} period=${snapshot.timing[2]} shouldRender=${snapshot.timing[4]} state=${snapshot.timing[3]} render=${snapshot.timing[4]} recenter=${snapshot.timing[11]} maskRevision=${snapshots.visibilityRevision()}"
     }
 
     private fun currentSnapshot(): WindowsVrRuntimeSnapshot? {
@@ -246,6 +261,19 @@ class WindowsVrControlServer(
             }
         }.joinToString(" ")
         return "OK flags=${snapshot.flags[0]} $rawValues $namedValues"
+    }
+
+    private fun locateHand(tokens: List<String>): String {
+        if (tokens.size != 4 || !tokens[1].startsWith("time=") ||
+            tokens[2] !in setOf("hand=0", "hand=1") ||
+            tokens[3] !in setOf("aim=0", "aim=1")) return "ERROR malformed"
+        val time = tokens[1].substringAfter('=').toLongOrNull()
+        if (time == null || time <= 0L) return "ERROR time_invalid"
+        val (pose, flags) = snapshots.locateHand(time, tokens[2].last().digitToInt(), tokens[3] == "aim=1")
+            ?: return "ERROR unavailable"
+        val fields = arrayOf("qx", "qy", "qz", "qw", "px", "py", "pz", "vx", "vy", "vz", "wx", "wy", "wz")
+        return "OK flags=${flags[0]} velocityFlags=${flags[1]} " +
+            fields.indices.joinToString(" ") { "${fields[it]}=${(pose[it] * 1_000_000f).toLong()}" }
     }
 
     private fun getInput(tokens: List<String>): String {

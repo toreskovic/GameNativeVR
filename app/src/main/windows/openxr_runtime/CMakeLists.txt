@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 project(gamenative_openxr_runtime C)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 
 include(FetchContent)
 FetchContent_Declare(

@@ -1,5 +1,8 @@
+#include "xr_performance.h"
+#include "xr_vulkan_diagnostic.h"
 #include "xr_windows_projection.h"
 #include "xr_fov.h"
+#include "xr_frame_interpolation.h"
 
 #include <EGL/eglext.h>
 #include <GLES2/gl2ext.h>
@@ -52,7 +55,9 @@ GLuint compileShader(GLenum type, const char *source) {
 }
 
 bool WindowsProjectionPresenter::initialize(XrSession session, int64_t format, uint32_t width,
-                                            uint32_t height, EGLDisplay display, int upscaler, float sgsrSharpness, float fovScale, int fovBorder) {
+                                            uint32_t height, EGLDisplay display, int upscaler, float sgsrSharpness, float fovScale, int fovBorder, bool fxaa, int ffrDebug, XrVulkanContext* vulkan) {
+    vulkan_=vulkan;
+    frameGenerator_.setVulkanContext(vulkan);
     session_ = session;
     fovScale_ = std::isfinite(fovScale) ? std::clamp(fovScale, 0.7f, 1.0f) : 1.0f;
     fovBorder_ = std::clamp(fovBorder, 0, 2);
@@ -72,6 +77,35 @@ bool WindowsProjectionPresenter::initialize(XrSession session, int64_t format, u
     info.faceCount = 1;
     info.arraySize = 2;
     info.mipCount = 1;
+    if(vulkan_) {
+        bool subsampled=!kXrSwapchainPattern &&
+            vulkan_->supportsSubsampledSwapchain(VkFormat(format),{width_,height_},2);
+        for (;;) {
+            // Request storage only. Our immutable FDM defines the same protected
+            // center and peripheral density as before; runtime FFR profiles
+            // would replace it with a headset-specific pattern.
+            XrVulkanSwapchainCreateInfoMETA storage{XR_TYPE_VULKAN_SWAPCHAIN_CREATE_INFO_META};
+            storage.additionalCreateFlags=VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT;
+            info.next=subsampled?&storage:nullptr;
+            const auto result=xrCreateSwapchain(session,&info,&swapchain_);
+            bool ready=false;
+            if(XR_SUCCEEDED(result)) {
+                vulkanPresenter_=std::make_unique<XrVulkanPresenter>();
+                ready=vulkanPresenter_->initialize(vulkan_,swapchain_,VkFormat(format),width_,height_,2,
+                    upscaler,sgsrSharpness,fovScale_,fovBorder_,fxaa,ffrDebug,subsampled);
+            }
+            LOGI("Vulkan projection: %ux%u, shared %s device, subsampled=%d create=%d ready=%d",
+                 width_,height_,vulkan_->driverLabel(),subsampled,result,ready);
+            if(ready) return true;
+            // Destroy framebuffer/views before releasing their runtime images.
+            vulkanPresenter_.reset();
+            if(swapchain_!=XR_NULL_HANDLE) xrDestroySwapchain(swapchain_);
+            swapchain_=XR_NULL_HANDLE;
+            if(!subsampled) return false;
+            LOGI("Subsampled projection setup failed; retrying ordinary swapchain");
+            subsampled=false;
+        }
+    }
     if (XR_FAILED(xrCreateSwapchain(session, &info, &swapchain_))) return false;
     uint32_t count = 0;
     if (XR_FAILED(xrEnumerateSwapchainImages(swapchain_, 0, &count, nullptr)) || count == 0) return false;
@@ -405,7 +439,7 @@ void WindowsProjectionPresenter::drawEye(uint32_t eye, const EyeFrame &source,
     if (sceneFramebuffer_) glBindFramebuffer(GL_FRAMEBUFFER, sceneFramebuffer_);
     glViewport(0, 0, static_cast<GLsizei>(sceneWidth_), static_cast<GLsizei>(sceneHeight_));
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, textures_[eye][source.imageIndex]);
+    glBindTexture(GL_TEXTURE_2D, renderTextures_[eye] ? renderTextures_[eye] : textures_[eye][source.imageIndex]);
     const float sourceWidth = source.sourceWidth > 0 ? source.sourceWidth : source.width;
     const float sourceHeight = source.sourceHeight > 0 ? source.sourceHeight : source.height;
     const float v0 = (source.flipY ? source.sourceY + sourceHeight : source.sourceY) /
@@ -439,38 +473,117 @@ void WindowsProjectionPresenter::discardFresh(WindowsFrameTransport &transport,
         transport.discardFrame(static_cast<int>(eye), frames[eye].imageIndex, frames[eye].serial);
         renderedSerials_[eye] = frames[eye].serial;
     }
+    frameGenerator_.cancelCapture();
 }
 
-bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpace space,
-                                        XrCompositionLayerProjection *layer, XrTime displayTime) {
-    if (layer == nullptr) return false;
-    if (!transport.hasStereoContent()) {
-        hasPresentedImage_ = false;
-        return false;
-    }
+VrFrameGenerator::Output WindowsProjectionPresenter::captureForGeneration(
+        WindowsFrameTransport &transport, XrTime displayTime, XrDuration period) {
     std::array<EyeFrame, 2> frames{};
-    if (!transport.pollStereo(frames)) {
-        if (!hasPresentedImage_) return false;
-        // xrEndFrame references the last released image. Keep its rendering pose
-        // and FOV, with no acquire, GL work, import or guest-buffer access.
-        *layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-        layer->space = space;
-        layer->viewCount = 2;
-        layer->views = views_.data();
-        recordPresentation(displayedFrames_, displayTime, true);
-        return true;
+    if (!frameGenerator_.claimFrames(transport, frames)) return {};
+    auto guestReadiness = std::make_shared<VrFrameGenerator::GuestReadiness>(frames);
+    int directFence = -1;
+    if (frameGenerator_.ingestVulkan(display_, frames, displayTime, period, guestReadiness, directFence)) {
+        frameGenerator_.releaseGuest(transport, frames, directFence);
+        for (int e = 0; e < 2; ++e) renderedSerials_[e] = frames[e].serial;
+        return {};
+    }
+    if (vulkan_) {
+        discardFresh(transport, frames, {true, true});
+        return {};
     }
     std::array<bool, 2> fresh{true, true};
     for (uint32_t eye = 0; eye < 2; ++eye) {
         if (!importEyeBuffer(eye, frames[eye], fresh[eye])) {
             discardFresh(transport, frames, fresh);
-            return false;
+            frameGenerator_.cancelCapture();
+            return {};
         }
+    }
+    const std::array<GLuint, 2> textures{textures_[0][frames[0].imageIndex], textures_[1][frames[1].imageIndex]};
+    auto captured = frameGenerator_.ingest(display_, textures, frames, displayTime, period, guestReadiness);
+    // Release even on capture failure. Partial guest reads must complete before
+    // reuse; the next guest pair can then pass through with generation disabled.
+    int fence = createReleaseFence();
+    int other = fence >= 0 ? dup(fence) : -1;
+    if (fence < 0 || other < 0) {
+        glFinish();
+        if (fence >= 0) close(fence);
+        if (other >= 0) close(other);
+        fence = other = -1;
+    }
+    transport.publishReleaseFence(0, frames[0].imageIndex, other);
+    transport.publishReleaseFence(1, frames[1].imageIndex, fence);
+    for (int eye = 0; eye < 2; ++eye) renderedSerials_[eye] = frames[eye].serial;
+    frameGenerator_.cancelCapture();
+    return captured;
+}
+
+void WindowsProjectionPresenter::prepareFrameGeneration(WindowsFrameTransport &transport) {
+    if (kXrSwapchainPattern && vulkan_) return;
+    if (!frameGenerator_.enabled() || lastDisplayTime_ <= 0 || !transport.hasStereoContent()) return;
+    // This runs before xrWaitFrame, on the same GL thread. No scheduler advance:
+    // observing completion must not consume a synthetic or real presentation.
+    frameGenerator_.updateWorker(transport, lastDisplayTime_ + displayPeriod_, displayPeriod_);
+    frameGenerator_.pollCompletion();
+    captureForGeneration(transport, lastDisplayTime_ + displayPeriod_, displayPeriod_);
+}
+
+bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpace space,
+                                        XrCompositionLayerProjection *layer, XrTime displayTime, XrDuration displayPeriod, int64_t displayDeadline) {
+    if(vulkan_) return renderVulkan(transport,space,layer,displayTime,displayPeriod,displayDeadline);
+    if (layer == nullptr) return false;
+    if (!transport.hasStereoContent()) {
+        resetFrameGeneration();
+        hasPresentedImage_ = false;
+        return false;
+    }
+    // A missed XR tick is not a refresh-rate change or a history discontinuity.
+    // Use xrWaitFrame's nominal period, keeping the last valid value if absent.
+    displayPeriod_ = nominalDisplayPeriod(displayPeriod, displayPeriod_);
+    const XrDuration period = displayPeriod_;
+    if (lastDisplayTime_ > 0 && displayTime <= lastDisplayTime_) resetFrameGeneration();
+    lastDisplayTime_ = displayTime;
+    std::array<EyeFrame, 2> frames{};
+    std::array<bool, 2> fresh{false, false};
+    renderTextures_ = {};
+    bool ready = false, synthetic = false;
+    if (frameGenerator_.enabled()) {
+        // Select a completed, due image before acquiring a swapchain image.
+        // If the worker is preparing a job, keep the previous projection this tick.
+        auto selected=frameGenerator_.advance(displayTime,period,displayDeadline);
+        if(selected) {
+            frames=selected.frames; renderTextures_=selected.textures;
+            synthetic=selected.synthetic; ready=true;
+        } else {
+            captureForGeneration(transport,displayTime,period);
+        }
+    }
+    if (!ready && frameGenerator_.canPresentReal()) {
+        ready = frameGenerator_.claimPassthrough(transport, frames);
+        if (ready) {
+            fresh = {true, true};
+            for (uint32_t eye=0; eye<2; ++eye) {
+                if (!importEyeBuffer(eye, frames[eye], fresh[eye])) {
+                    discardFresh(transport, frames, fresh);
+                    return false;
+                }
+            }
+        }
+    }
+    if (!ready) {
+        if (!hasPresentedImage_) return false;
+        *layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        layer->space = space;
+        layer->viewCount = 2;
+        layer->views = views_.data();
+        recordPresentation(displayedFrames_, displayTime, true, displayedSynthetic_);
+        return true;
     }
     XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     uint32_t imageIndex = 0;
     if (XR_FAILED(xrAcquireSwapchainImage(swapchain_, &acquire, &imageIndex))) {
         discardFresh(transport, frames, fresh);
+        frameGenerator_.cancelPresentation();
         return false;
     }
     hasPresentedImage_ = false;
@@ -480,6 +593,7 @@ bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpac
         XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(swapchain_, &release);
         discardFresh(transport, frames, fresh);
+        frameGenerator_.cancelPresentation();
         return false;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_);
@@ -539,6 +653,14 @@ bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpac
                                       releaseFences[eye]);
         renderedSerials_[eye] = frames[eye].serial;
     }
+    if (freshCount > 0) frameGenerator_.cancelCapture();
+    if (renderTextures_[0]) {
+        // Insert immediately after the last actual read, before runtime/overlay
+        // work. Reservation prevents worker reuse until this fence is published.
+        int readFence = createReleaseFence();
+        frameGenerator_.notePresented(frames[0].targetDisplayTime);
+        frameGenerator_.finishRead(renderTextures_, readFence);
+    }
     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     if (XR_FAILED(xrReleaseSwapchainImage(swapchain_, &release))) return false;
     *layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -547,22 +669,30 @@ bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpac
     layer->views = views_.data();
     hasPresentedImage_ = true;
     displayedFrames_ = frames;
-    recordPresentation(frames, displayTime, false);
+    displayedSynthetic_ = synthetic;
+    recordPresentation(frames, displayTime, false, synthetic);
     return true;
 }
 
 void WindowsProjectionPresenter::recordPresentation(const std::array<EyeFrame, 2> &frames,
-                                                     XrTime displayTime, bool reused) {
+                                                     XrTime displayTime, bool reused, bool synthetic) {
+    if(frameGenerator_.enabled()) vrPerformance.used.fetch_or(4); else vrPerformance.used.fetch_and(~4u);
+    if (!reused) frameGenerator_.notePresented(frames[0].targetDisplayTime);
     if (reused) ++reusedImages_;
+    if (synthetic && !reused) ++generatedPairs_;
     // Target lateness is presentation-slot time minus the guest's intended display time;
     // it is not a GPU duration or a claim about physical scanout time.
     if (timingLogStart_ == 0) timingLogStart_ = displayTime;
     ++presentedPairs_;
     if (frames[0].frameId && frames[1].frameId) {
-        if (frames[0].frameId == previousFrameIds_[0] && frames[1].frameId == previousFrameIds_[1])
+        if (synthetic == previousSynthetic_ && frames[0].frameId == previousFrameIds_[0] && frames[1].frameId == previousFrameIds_[1])
             ++repeatedPairs_;
         if (frames[0].frameId != frames[1].frameId) ++mixedPairs_;
     }
+    vrPerformance.selected(reused || (frames[0].frameId && frames[1].frameId &&
+        synthetic == previousSynthetic_ && frames[0].frameId == previousFrameIds_[0] &&
+        frames[1].frameId == previousFrameIds_[1]));
+    previousSynthetic_ = synthetic;
     for (size_t eye = 0; eye < 2; ++eye) {
         previousFrameIds_[eye] = frames[eye].frameId;
         if (frames[eye].targetDisplayTime <= 0) continue;
@@ -572,22 +702,27 @@ void WindowsProjectionPresenter::recordPresentation(const std::array<EyeFrame, 2
         ++timedEyes_;
     }
     if (displayTime - timingLogStart_ >= 5000000000LL) {
-        LOGI("VR presentation: pairs=%llu repeated=%llu mixed=%llu reusedImages=%llu timedEyes=%llu targetLateMs(avg/max)=%.2f/%.2f",
+        LOGI("VR presentation: pairs=%llu repeated=%llu mixed=%llu reusedImages=%llu timedEyes=%llu targetLateMs(avg/max)=%.2f/%.2f generated=%llu",
              (unsigned long long)presentedPairs_, (unsigned long long)repeatedPairs_,
              (unsigned long long)mixedPairs_, (unsigned long long)reusedImages_, (unsigned long long)timedEyes_,
-             timedEyes_ ? latenessSumMs_ / timedEyes_ : 0.0, latenessMaxMs_);
+             timedEyes_ ? latenessSumMs_ / timedEyes_ : 0.0, latenessMaxMs_, (unsigned long long)generatedPairs_);
         timingLogStart_ = displayTime;
-        presentedPairs_ = repeatedPairs_ = mixedPairs_ = timedEyes_ = reusedImages_ = 0;
+        presentedPairs_ = repeatedPairs_ = mixedPairs_ = timedEyes_ = reusedImages_ = generatedPairs_ = 0;
         latenessSumMs_ = latenessMaxMs_ = 0;
     }
 }
 
 void WindowsProjectionPresenter::shutdown() {
+    frameGenerator_.shutdown();
+    if(vulkanPresenter_) { vulkanPresenter_->shutdown();vulkanPresenter_.reset(); }
+    lastDisplayTime_ = 0;
+    displayPeriod_ = 13888889;
+    renderTextures_ = {};
     hasPresentedImage_ = false;
     displayedFrames_ = {};
     previousFrameIds_ = {};
     timingLogStart_ = 0;
-    presentedPairs_ = repeatedPairs_ = mixedPairs_ = timedEyes_ = reusedImages_ = 0;
+    presentedPairs_ = repeatedPairs_ = mixedPairs_ = timedEyes_ = reusedImages_ = generatedPairs_ = 0;
     latenessSumMs_ = latenessMaxMs_ = 0;
     if (sceneFramebuffer_) glDeleteFramebuffers(1, &sceneFramebuffer_);
     if (sceneTexture_) glDeleteTextures(1, &sceneTexture_);
@@ -619,6 +754,90 @@ void WindowsProjectionPresenter::shutdown() {
     program_ = 0;
     framebuffer_ = 0;
     swapchain_ = XR_NULL_HANDLE;
+}
+
+bool WindowsProjectionPresenter::renderVulkan(WindowsFrameTransport& transport,XrSpace space,
+    XrCompositionLayerProjection* layer,XrTime time,XrDuration period,int64_t deadline) {
+    if(!layer || !vulkanPresenter_) return false;
+    if(!transport.hasStereoContent()) {resetFrameGeneration();hasPresentedImage_=false;return false;}
+#ifdef GN_XR_SWAPCHAIN_PATTERN
+    // Use current runtime poses, without claiming/importing a game image.
+    // The ordinary quad remains visible until the game announces stereo content.
+    XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
+    locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    locate.displayTime = time;
+    locate.space = space;
+    XrViewState state{XR_TYPE_VIEW_STATE};
+    std::array<XrView, 2> located{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
+    uint32_t count = 0;
+    if (XR_FAILED(xrLocateViews(session_, &locate, &state, 2, &count, located.data())) ||
+        count != 2 || !(state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
+        return false;
+    int fence = -1;
+    const bool ok = vulkanPresenter_->render({}, fence);
+    if (fence >= 0) close(fence);
+    if (!ok) return false;
+    for (uint32_t e = 0; e < 2; ++e) {
+        views_[e] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+        views_[e].pose = located[e].pose;
+        views_[e].fov = located[e].fov;
+        views_[e].subImage = {swapchain_, {{0, 0}, {int32_t(width_), int32_t(height_)}}, e};
+    }
+    *layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    layer->space = space;
+    layer->viewCount = 2;
+    layer->views = views_.data();
+    return true;
+#endif
+    displayPeriod_=nominalDisplayPeriod(period,displayPeriod_);
+    if(lastDisplayTime_>0 && time<=lastDisplayTime_) resetFrameGeneration();
+    lastDisplayTime_=time;
+    std::array<EyeFrame,2> frames{};
+    VrFrameGenerator::Output selected{};
+    bool guest=false,ready=false;
+    if(frameGenerator_.enabled()) {
+        selected=frameGenerator_.advance(time,displayPeriod_,deadline);
+        if(selected) {frames=selected.frames;ready=true;}
+        else captureForGeneration(transport,time,displayPeriod_);
+    }
+    if(!ready && frameGenerator_.canPresentReal()) guest=ready=frameGenerator_.claimPassthrough(transport,frames,true);
+    if(ready) {
+        std::array<XrFovf,2> outputFovs;
+        for(int e=0;e<2;++e) {
+            const auto &f=frames[e];
+            outputFovs[e]={f.projectionFov[0],f.projectionFov[1],f.projectionFov[2],f.projectionFov[3]};
+            if(fovScale_<1 && fovBorder_!=0) {
+                scaleFovPair(outputFovs[e].angleLeft,outputFovs[e].angleRight,1/fovScale_);
+                scaleFovPair(outputFovs[e].angleUp,outputFovs[e].angleDown,1/fovScale_);
+            }
+        }
+        vulkanPresenter_->setVisibilityMasks(visibilityMasks_,outputFovs,visibilityRevision_);
+        int fence=-1;bool ok=false;
+        if(guest) ok=vulkanPresenter_->renderGuest(frames,fence);
+        else {
+            std::array<XrVulkanPresenter::Source,2> sources{};
+            for(int e=0;e<2;++e) {sources[e].image=selected.images[e];sources[e].view=selected.views[e];sources[e].frame=frames[e];}
+            ok=vulkanPresenter_->render(sources,fence);
+        }
+        if(guest) frameGenerator_.releaseGuest(transport,frames,fence);
+        else frameGenerator_.finishRead(selected.textures,fence);
+        if(!ok) {hasPresentedImage_=false;return false;}
+        for(int e=0;e<2;++e) {
+            auto& view=views_[e];const auto& f=frames[e];
+            view={XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+            view.pose.orientation={f.projectionOrientation[0],f.projectionOrientation[1],f.projectionOrientation[2],f.projectionOrientation[3]};
+            view.pose.position={f.projectionPosition[0],f.projectionPosition[1],f.projectionPosition[2]};
+            view.fov={f.projectionFov[0],f.projectionFov[1],f.projectionFov[2],f.projectionFov[3]};
+            if(fovScale_<1 && fovBorder_!=0){scaleFovPair(view.fov.angleLeft,view.fov.angleRight,1/fovScale_);scaleFovPair(view.fov.angleUp,view.fov.angleDown,1/fovScale_);}
+            view.subImage.swapchain=swapchain_;view.subImage.imageRect={{0,0},{int32_t(width_),int32_t(height_)}};view.subImage.imageArrayIndex=e;
+        }
+        displayedFrames_=frames;displayedSynthetic_=selected.synthetic;hasPresentedImage_=true;
+        frameGenerator_.notePresented(frames[0].targetDisplayTime);
+    }
+    if(!hasPresentedImage_) return false;
+    *layer={XR_TYPE_COMPOSITION_LAYER_PROJECTION};layer->space=space;layer->viewCount=2;layer->views=views_.data();
+    recordPresentation(displayedFrames_,time,!ready,displayedSynthetic_);
+    return true;
 }
 
 }

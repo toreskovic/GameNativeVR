@@ -106,6 +106,8 @@ void VKAPI_CALL fakeBegin(VkCommandBuffer, const VkRenderingInfo *ci) {
         VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_INFO_EXT)
       attached = true;
 }
+VkPipeline lastBound{};
+void VKAPI_CALL fakeBind(VkCommandBuffer,VkPipelineBindPoint,VkPipeline pipeline) { checkForwardUnlocked();lastBound=pipeline; }
 void VKAPI_CALL fakeEnd(VkCommandBuffer) {}
 void VKAPI_CALL fakeDraw(VkCommandBuffer, uint32_t, uint32_t, uint32_t, int32_t,
                          uint32_t) { checkForwardUnlocked(); }
@@ -193,6 +195,7 @@ PFN_vkVoidFunction VKAPI_CALL fakeGdpa(VkDevice, const char *n) {
   MAP("vkCmdBeginRenderPass2KHR", fakeLegacy2);
   MAP("vkCmdBeginRendering", fakeBegin);
   MAP("vkCmdEndRendering", fakeEnd);
+  MAP("vkCmdBindPipeline", fakeBind);
   MAP("vkCmdDrawIndexed", fakeDraw);
   MAP("vkCmdDrawIndirect", fakeIndirect);
   MAP("vkCmdDrawIndexedIndirect", fakeIndirect);
@@ -717,8 +720,8 @@ int main() {
   ffr::Rect eyes[2] = {{0, 0, 1000, 1000}, {1000, 0, 1000, 1000}};
   assert(ffr::density(500, 500, eyes, 2) == 255 &&
          ffr::density(1500, 500, eyes, 2) == 255);
-  assert(ffr::density(800, 500, eyes, 2) == 128 &&
-         ffr::density(1, 1, eyes, 2) == 64);
+  assert(ffr::density(800, 500, eyes, 2) == 127 &&
+         ffr::density(1, 1, eyes, 2) == 63);
   // MRT diagnostics must observe geometry without attaching a density map or
   // training the single-color selection history.
   d->debug = true;
@@ -978,6 +981,30 @@ int main() {
   assert(std::string(sampledCoverageRejection(goodDraw,generic)) == "descriptor-updated-after-draw");
   d->mode = 1;
   assert(!sampledAncestry(d, sceneImage, inferredEyes, inferredCount));
+  // Debug twins are bound only inside an actually foveated pass, and normal
+  // state is restored at its end without adding draws or changing dynamic state.
+  auto normal=reinterpret_cast<VkPipeline>(uintptr_t(0xa001));
+  auto tinted=reinterpret_cast<VkPipeline>(uintptr_t(0xa002));
+  d->tilePreview=true;d->previewPipelines[normal]=tinted;
+  vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,normal);
+  assert(lastBound==normal);
+  d->commands[command].fdmAttached=true;
+  vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,normal);
+  assert(lastBound==tinted && d->commands[command].graphicsPipeline==normal);
+  vkCmdEndRendering(command);
+  assert(lastBound==normal && !d->commands[command].fdmAttached);
+  // Tilers record scene draws in secondary buffers before the primary begins
+  // rendering. Their actual density is supplied by the parent at execution.
+  inherited.depthAttachmentFormat=VK_FORMAT_D32_SFLOAT;
+  vkBeginCommandBuffer(secondary,&beginSecondary);
+  assert(d->commands[secondary].inherited && d->commands[secondary].depth);
+  vkCmdBindPipeline(secondary,VK_PIPELINE_BIND_POINT_GRAPHICS,normal);
+  assert(lastBound==tinted && d->commands[secondary].previewBound);
+  inherited.depthAttachmentFormat=VK_FORMAT_UNDEFINED;
+  vkBeginCommandBuffer(secondary,&beginSecondary);
+  vkCmdBindPipeline(secondary,VK_PIPELINE_BIND_POINT_GRAPHICS,normal);
+  assert(lastBound==normal && !d->commands[secondary].previewBound);
+  d->tilePreview=false;d->previewPipelines.clear();
   d->maps.clear();
   devices.clear();
   std::cout << "FFR dispatch, selection, stereo mask, unsupported-device and "

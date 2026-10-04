@@ -18,11 +18,14 @@
 #pragma once
 
 #include <android/hardware_buffer.h>
+#include "xr_frame_interpolation.h"
 
 #include <array>
+#include <deque>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <functional>
 #include <string>
 #include <thread>
 
@@ -41,6 +44,8 @@ struct EyeFrame {
 
     AHardwareBuffer* buffer{nullptr};
     bool swapRedBlue{false};
+    bool foveatedPacked{false}; // v1: logical dimensions, physical extent gn_packed_extent(logical)
+    uint32_t bufferLayer{0};
 
     int planeCount{0};
     int dmabufFds[kMaxPlanes]{-1, -1, -1, -1};
@@ -66,6 +71,8 @@ struct EyeFrame {
     uint64_t serial{0};
     uint64_t frameId{0};
     int64_t targetDisplayTime{0};
+    int64_t arrivalInterval{0}; // Complete stereo cadence, measured before consumer selection
+    int64_t receivedAt{0}; // CLOCK_MONOTONIC, stereo arrival/cadence only
 };
 
 class WindowsFrameTransport {
@@ -79,12 +86,15 @@ public:
     WindowsFrameTransport(const WindowsFrameTransport&) = delete;
     WindowsFrameTransport& operator=(const WindowsFrameTransport&) = delete;
 
+    // Set before start. Runs on the transport thread without eyesMutex_.
+    std::function<bool(const EyeFrame&)> probeHardwareBuffer;
     void start(const std::string& socketPath);
 
     void stop();
 
     // Claim both eyes under one lock, only once and only for the same game frame.
-    bool pollStereo(std::array<EyeFrame, 2> &frames);
+    bool setFrameWakeFd(int fd); // owns a duplicate; notification only, no callbacks
+    bool pollStereo(std::array<EyeFrame, 2> &frames, bool readyOnly = false);
 
     void publishReleaseFence(int eye, int imageIndex, int releaseFenceFd);
 
@@ -100,12 +110,14 @@ private:
     bool handleFrameLine(int clientFd, const std::string& line);
     bool handleAcquireLine(int clientFd, const std::string& line);
     void storeEyeBuffer(int eye, AHardwareBuffer* ahb, int32_t w, int32_t h,
-                        int32_t index, bool swapRedBlue);
+                        int32_t index, bool swapRedBlue, uint32_t layer = 0, bool packed = false);
     void storeEyeDmabuf(int eye, const EyeFrame& incoming);
     void releaseSlotLocked(int eye, int imageIndex);
     void releaseEye(int eye);
     void resetEye(int eye);
     void dropRetainedLocked(int eye);
+    void dropPendingLocked(int eye, size_t index);
+    void forgetPendingImageLocked(int eye, int imageIndex);
 
     std::string socketPath_;
     std::atomic<bool> running_{false};
@@ -114,10 +126,16 @@ private:
     std::thread acceptThread_;
 
     std::mutex eyesMutex_;
+    int frameWakeFd_ = -1;
+    StereoArrivalCadence arrivalCadence_;
     std::condition_variable releaseCv_;
     EyeFrame buffers_[kEyeCount][kMaxImages];
     EyeFrame latest_[kEyeCount];
     EyeFrame retained_[kEyeCount];
+    // Bounded metadata/fence history; buffers_ owns the registered images.
+    // A newer unfinished announcement must not hide an older ready stereo pair.
+    std::deque<EyeFrame> pending_[kEyeCount];
+    static constexpr size_t kPendingFrames = 4;
     bool latestClaimed_[kEyeCount]{false, false};
     int releaseFenceFds_[kEyeCount][kMaxImages];
     bool releasePending_[kEyeCount][kMaxImages]{};

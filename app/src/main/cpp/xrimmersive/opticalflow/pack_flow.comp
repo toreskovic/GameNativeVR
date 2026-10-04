@@ -1,0 +1,24 @@
+#version 450
+// Final vector medoid filtering and packing replace both final filters and the
+// full-resolution synthesis dispatch. XY = forward; ZW = reverse (luma pixels).
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform isampler2D forwardFlow;
+layout(binding=1) uniform isampler2D backwardFlow;
+layout(binding=2,rgba16f) writeonly uniform image2D packedFlow;
+ivec2 filtered(isampler2D source,ivec2 pos) {
+    ivec2 v[9],hi=textureSize(source,0)-1; int k=0;
+    for(int x=-1;x<=1;++x) for(int y=-1;y<=1;++y)
+        v[k++]=texelFetch(source,clamp(pos+ivec2(x,y),ivec2(0),hi),0).xy;
+    uint best=0xffffffffu; int chosen=0;
+    for(int i=0;i<9;++i) {
+        uint error=0u;
+        for(int j=0;j<9;++j) { ivec2 d=v[i]-v[j]; error+=uint(d.x*d.x+d.y*d.y); }
+        if(error<best) {best=error;chosen=i;}
+    }
+    return v[chosen];
+}
+void main() {
+    ivec2 pos=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(pos,imageSize(packedFlow)))) return;
+    imageStore(packedFlow,pos,vec4(filtered(forwardFlow,pos),filtered(backwardFlow,pos)));
+}

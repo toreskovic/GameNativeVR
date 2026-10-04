@@ -166,6 +166,7 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
     private var captureHandler: Handler? = null
     private val captureActive = AtomicBoolean(false)
     private var gameCaptureBitmap: Bitmap? = null
+    @Volatile private var pixelCopyFrameReady = false
     private val overlayLock = Any()
     private var overlayLayerBitmap: Bitmap? = null
     private var finalFrameBitmap: Bitmap? = null
@@ -542,6 +543,8 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
         var refreshRate = 72f
         var upscaler = 0
         var sgsrSharpness = 0.7f
+        var ffrDebug = 0
+        var fxaa = true
         var fovScale = 1f
         var fovBorder = 0
         currentAppId?.let { appId ->
@@ -555,6 +558,8 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
                 }
                 refreshRate = container.xrRefreshRate.toFloat()
                 sgsrSharpness = container.xrSgsrSharpness / 100f
+                ffrDebug = if (container.xrFfrDebug == 1 && container.xrFoveation == 0) 0 else container.xrFfrDebug
+                fxaa = container.xrFxaa
                 fovScale = container.xrFovScale / 100f
                 fovBorder = container.xrFovBorder
                 upscaler = if (container.xrRenderScale < 100) container.xrUpscaler else 0
@@ -566,7 +571,7 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
         }
         val (eyeWidth, eyeHeight) = physicalEyeResolution()
         xrSessionHandle = try {
-            XrNative.nativeCreate(this, quadW, quadH, refreshRate, upscaler, eyeWidth, eyeHeight, sgsrSharpness, fovScale, fovBorder)
+            XrNative.nativeCreate(this, quadW, quadH, refreshRate, upscaler, eyeWidth, eyeHeight, sgsrSharpness, fovScale, fovBorder, fxaa, ffrDebug)
         } catch (t: Throwable) {
             Timber.w(t, "Native OpenXR module unavailable — immersive rendering/controller mapping disabled")
             return
@@ -1146,7 +1151,14 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
      * Compose overlay re-renders on a slower timer ([OVERLAY_REFRESH_INTERVAL_MS]) on the UI
      * thread, which View.draw requires. [overlayLock] guards the shared bitmap.
      */
+    private var performanceOverlayJob: kotlinx.coroutines.Job? = null
+
     private fun startFrameCaptureLoop() {
+        performanceOverlayJob?.cancel()
+        val performanceHandle = xrSessionHandle
+        performanceOverlayJob = lifecycleScope.launch(Dispatchers.IO) {
+            VrPerformanceOverlay(performanceHandle).run()
+        }
         captureThread = HandlerThread("XrFrameCapture").apply { start() }
         captureHandler = Handler(captureThread!!.looper)
         captureActive.set(true)
@@ -1240,6 +1252,7 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
             PluviaApp.xServerView?.queueEvent { bridge.release() }
         }
         directRenderActive = false
+        pixelCopyFrameReady = false
     }
 
     private fun applyFlatPresentationGate(enabled: Boolean) {
@@ -1350,6 +1363,7 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
             drawPointerCursors(canvas, width, height)
         }
         XrNative.nativeSubmitFrame(xrSessionHandle, finalBitmap)
+        pixelCopyFrameReady = true
     }
 
     /** Slow path: re-renders just the Compose overlay (transparent where the game is) into
@@ -1360,6 +1374,11 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
         val handler = captureHandler ?: return
         handler.postDelayed({ refreshOverlayLayer() }, delayMs)
     }
+
+    // The launcher splash exists before the X server has a capturable frame.
+    // Submit it independently until PixelCopy can supply the combined bitmap.
+    private fun shouldSubmitOverlayBitmap(): Boolean =
+        directRenderActive || flatPresentationSuspended || !pixelCopyFrameReady
 
     private fun refreshOverlayLayer() {
         runOnUiThread {
@@ -1395,7 +1414,7 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
                         ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { overlayLayerBitmap = it }
                     android.graphics.Canvas(bitmap)
                         .drawColor(android.graphics.Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR)
-                    if ((directRenderActive || flatPresentationSuspended) && xrSessionHandle != 0L) {
+                    if (shouldSubmitOverlayBitmap() && xrSessionHandle != 0L) {
                         XrNative.nativeSubmitFrame(xrSessionHandle, bitmap)
                     }
                 }
@@ -1422,7 +1441,7 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
                         if (surfaceView != null) surfaceView.alpha = previousAlpha
                     }
                 }
-                if ((directRenderActive || flatPresentationSuspended) && xrSessionHandle != 0L) {
+                if (shouldSubmitOverlayBitmap() && xrSessionHandle != 0L) {
                     synchronized(overlayLock) {
                         overlayLayerBitmap?.let { XrNative.nativeSubmitFrame(xrSessionHandle, it) }
                     }
@@ -1446,11 +1465,18 @@ class ImmersiveXrActivity : androidx.activity.ComponentActivity() {
     }
 
     private fun stopFrameCaptureLoop() {
+        // Retire all bitmap JNI calls before destroying/reusing the session handle.
+        performanceOverlayJob?.let { job ->
+            job.cancel()
+            kotlinx.coroutines.runBlocking { job.join() }
+        }
+        performanceOverlayJob = null
         captureActive.set(false)
         captureThread?.quitSafely()
         captureThread = null
         captureHandler = null
         gameCaptureBitmap = null
+        pixelCopyFrameReady = false
         finalFrameBitmap = null
         synchronized(overlayLock) { overlayLayerBitmap = null }
         surfaceCallbackAttachedTo?.holder?.removeCallback(surfaceReadyCallback)

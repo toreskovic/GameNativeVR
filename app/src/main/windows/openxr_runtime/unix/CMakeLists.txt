@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 project(gamenative_xr_unixbridge C)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 
 add_library(gamenative_xr_unixbridge SHARED gamenative_openxr_unix.c)
 target_include_directories(gamenative_xr_unixbridge PRIVATE ..)

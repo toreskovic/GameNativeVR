@@ -18,6 +18,18 @@ class Handler(socketserver.StreamRequestHandler):
                 response = f"OK flags=1 lpx={n * 1000000} lqw=1000000 rqw=1000000"
                 if command == "LOCATE_VIEWS time=3000000000":
                     response = "ERROR unavailable"
+            if command.startswith("LOCATE_HAND"):
+                n = sum(c.startswith("LOCATE_HAND") for c in commands)
+                response = f"OK flags=15 velocityFlags=3 qw=1000000 px={n * 1000000} vx=1000000 wz=2000000"
+                if "time=4200000000" in command:
+                    response = "OK flags=1 velocityFlags=2 qw=1000000"
+                if "time=4300000000" in command:
+                    response = "OK flags=0 velocityFlags=0"
+                if "time=4400000000" in command:
+                    response = "ERROR unavailable"
+            if command == "FRAME_SYNC":
+                n = commands.count(command)
+                response = "ERROR gpu_busy" if n == 1 else "OK serial=1 time=5000000000 period=11111111 render=1\nOK flags=1\nOK\nOK"
             self.wfile.write((response + "\n").encode())
             self.wfile.flush()
 class Server(socketserver.ThreadingTCPServer):
@@ -33,4 +45,12 @@ with Server(("127.0.0.1", 38476), Handler) as server:
         "LOCATE_VIEWS time=2000000000", "LOCATE_VIEWS time=2500000000",
         "LOCATE_VIEWS time=3000000000",
     ], commands
-    print("Requested-time queries, late refresh, validity flags, and failure handling passed")
+    assert [c for c in commands if c.startswith("LOCATE_HAND")] == [
+        "LOCATE_HAND time=4000000000 hand=0 aim=0",
+        "LOCATE_HAND time=4000000000 hand=0 aim=0",
+        "LOCATE_HAND time=4100000000 hand=1 aim=1",
+        "LOCATE_HAND time=4200000000 hand=1 aim=1",
+        "LOCATE_HAND time=4300000000 hand=1 aim=1",
+        "LOCATE_HAND time=4400000000 hand=1 aim=1",
+    ], commands
+    print("Head/controller requested-time queries, late refresh, offsets, velocities, action-state isolation and failure handling passed")

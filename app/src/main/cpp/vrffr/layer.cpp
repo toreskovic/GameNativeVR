@@ -1,6 +1,7 @@
-// Experimental app-scoped Vulkan FDM layer. No shader rewriting or timing
-// queries.
+// Experimental app-scoped Vulkan FDM layer. Shader instrumentation is only
+// enabled for the explicit hardware tile visualization; no timing queries.
 #include "selection.h"
+#include "fragment_debug.h"
 #include "pass_history.h"
 #include "capabilities.h"
 #include <algorithm>
@@ -91,6 +92,8 @@ struct Commands {
   VkImage color{};
   ffr::PassHistory::Ticket passTicket{};
   bool fdmAttached = false;
+  VkPipeline graphicsPipeline{};
+  bool previewBound = false;
 
   bool depth = false;
   uint32_t draws = 0, indexed = 0, signature = 0, indexedVertices = 0;
@@ -131,6 +134,10 @@ struct Device {
   PFN_vkSetDeviceLoaderData setLoaderData{};
   bool enabled = false, knownEngine = false, debug = false;
   bool sampledTrace = false;
+  bool tilePreview = false;
+  unsigned previewReports = 0, previewFailures = 0, previewExecutions = 0;
+  std::unordered_map<VkShaderModule, std::vector<uint32_t>> previewShaders;
+  std::unordered_map<VkPipeline, VkPipeline> previewPipelines;
   std::unordered_map<VkDescriptorSetLayout, descriptor_trace::Layout> descriptorLayouts;
   std::unordered_map<VkPipelineLayout, std::vector<descriptor_trace::Layout>> pipelineLayouts;
   std::unordered_map<VkDescriptorSet, std::shared_ptr<descriptor_trace::Set>> descriptorSets;
@@ -1197,6 +1204,8 @@ vkCreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo *ci,
   d->instance = inst;
   d->next = next;
   d->setLoaderData = setData;
+  const char *previewEnv = getenv("GN_VR_FFR_TILE_PREVIEW");
+  d->tilePreview = previewEnv && !strcmp(previewEnv, "1");
   const char *debugEnv = getenv("GN_VR_FFR_DEBUG");
   d->sampledTrace = debugEnv && !strcmp(debugEnv, "1");
   // Retire the broad experimental log stream; DEBUG now requests focused tracing.
@@ -1408,6 +1417,8 @@ vkDestroyDevice(VkDevice h, const VkAllocationCallbacks *a) {
     return;
   for (auto &m : d->maps)
     destroyMap(d, *m);
+  auto destroyPipeline = reinterpret_cast<PFN_vkDestroyPipeline>(d->next(h,"vkDestroyPipeline"));
+  for (auto& p : d->previewPipelines) destroyPipeline(h,p.second,nullptr);
   auto fn = FN(d, vkDestroyDevice);
   for (auto i = queueFamilies.begin(); i != queueFamilies.end();)
     if (key(i->first) == key(h))
@@ -1589,6 +1600,11 @@ vkBeginCommandBuffer(VkCommandBuffer h, const VkCommandBufferBeginInfo *ci) {
         c.diagnosticInheritance = d->debug && inherited->colorAttachmentCount >= 2 &&
             !(inherited->flags & ~VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT);
         c.viewMask = inherited->viewMask;
+        // DXVK records tiler draws before the parent rendering scope exists.
+        // Tint depth-bearing single-color scene secondaries. FragSizeEXT reads
+        // the executing parent's real FDM, or 1x1 if that parent has no FDM.
+        // Depthless postprocessing remains untouched so it preserves the tint.
+        c.depth = inherited->depthAttachmentFormat != VK_FORMAT_UNDEFINED;
       }
     }
   }
@@ -1768,14 +1784,28 @@ vkCmdBeginRendering(VkCommandBuffer h, const VkRenderingInfo *ci) {
   auto forward = FN(d, vkCmdBeginRendering);
   guard.unlock();
   forward(h, &info);
+  if (d->tilePreview) {
+    guard.lock();
+    const auto& state=d->commands[h];
+    auto it=d->previewPipelines.find(state.graphicsPipeline);
+    VkPipeline pipeline=state.graphicsPipeline;
+    if (state.fdmAttached && it!=d->previewPipelines.end()) pipeline=it->second;
+    auto bind=reinterpret_cast<PFN_vkCmdBindPipeline>(d->next(d->handle,"vkCmdBindPipeline"));
+    guard.unlock();
+    if (pipeline) bind(h,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);
+  }
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer h) {
   std::unique_lock<std::recursive_mutex> guard(lock);
   auto d = dev(h);
+  auto pipeline=d->commands[h].graphicsPipeline;
+  const bool restore=d->tilePreview && d->commands[h].fdmAttached && pipeline;
   finish(d, d->commands[h]);
+  auto bind=restore ? reinterpret_cast<PFN_vkCmdBindPipeline>(d->next(d->handle,"vkCmdBindPipeline")) : nullptr;
   auto forward = FN(d, vkCmdEndRendering);
   guard.unlock();
   forward(h);
+  if (restore) bind(h,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetViewport(VkCommandBuffer h,
                                                    uint32_t first,
@@ -1983,6 +2013,15 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdExecuteCommands(
       }
     }
   }
+  if (d->tilePreview && parent.fdmAttached && d->previewExecutions<3) {
+    unsigned tinted=0;
+    for (uint32_t j=0;j<count;++j) {
+      auto child=d->commands.find(buffers[j]);
+      if (child!=d->commands.end() && child->second.previewBound) ++tinted;
+    }
+    ++d->previewExecutions;
+    LOG("tile preview: selected pass executes %u/%u instrumented secondary buffers",tinted,count);
+  }
   uint32_t added = 0;
   if (d->debug && parent.rendering && parent.diagnosticTarget) {
     for (unsigned j = 0; j < count; ++j) {
@@ -2122,12 +2161,12 @@ namespace {
 // it without mutating the caller's pNext chain (DXVK may reuse it
 // concurrently).
 bool patchFlags2(VkGraphicsPipelineCreateInfo &ci,
-                 std::vector<std::unique_ptr<uint8_t[]>> &storage) {
+                 std::vector<std::unique_ptr<uint8_t[]>> &storage,
+                 VkStructureType targetType=VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR) {
   auto first = static_cast<const VkBaseInStructure *>(ci.pNext);
   auto target = first;
   while (target &&
-         target->sType !=
-             VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR)
+         target->sType != targetType)
     target = target->pNext;
   if (!target)
     return true;
@@ -2181,7 +2220,8 @@ bool patchFlags2(VkGraphicsPipelineCreateInfo &ci,
     else
       ci.pNext = copy;
     if (node == target) {
-      reinterpret_cast<VkPipelineCreateFlags2CreateInfoKHR *>(copy)->flags |=
+      if (targetType==VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR)
+        reinterpret_cast<VkPipelineCreateFlags2CreateInfoKHR *>(copy)->flags |=
           VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT;
       return true;
     }
@@ -2214,8 +2254,117 @@ vkCreateGraphicsPipelines(VkDevice h, VkPipelineCache cache, uint32_t n,
           VK_PIPELINE_CREATE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT;
     }
   auto forward = FN(d, vkCreateGraphicsPipelines);
+  // Module-identifier-only cache hits hide the shader code. Ask DXVK's normal
+  // compile-required fallback for SPIR-V while the preview is enabled.
+  if (d->tilePreview && d->enabled) for (const auto& p:copy) {
+    uint64_t flags=p.flags;
+    for (auto q=static_cast<const VkBaseInStructure*>(p.pNext);q;q=q->pNext)
+      if (q->sType==VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR)
+        flags=reinterpret_cast<const VkPipelineCreateFlags2CreateInfoKHR*>(q)->flags;
+    for (uint32_t j=0;j<p.stageCount;++j) if (p.pStages[j].stage==VK_SHADER_STAGE_FRAGMENT_BIT)
+      for (auto q=static_cast<const VkBaseInStructure*>(p.pStages[j].pNext);q;q=q->pNext)
+        if (q->sType==VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT &&
+            (flags&VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)) {
+          std::fill(out,out+n,VK_NULL_HANDLE);return VK_PIPELINE_COMPILE_REQUIRED_EXT;
+        }
+  }
   guard.unlock();
-  return forward(h, cache, n, copy.data(), a, out);
+  auto result=forward(h, cache, n, copy.data(), a, out);
+  guard.lock();
+  if (!d->tilePreview || !d->enabled) return result;
+  auto createModule=reinterpret_cast<PFN_vkCreateShaderModule>(d->next(h,"vkCreateShaderModule"));
+  auto destroyModule=reinterpret_cast<PFN_vkDestroyShaderModule>(d->next(h,"vkDestroyShaderModule"));
+  for (uint32_t i=0;i<n;++i) {
+    if (!out[i] || copy[i].renderPass) continue;
+    auto debug=copy[i];
+    std::vector<VkPipelineShaderStageCreateInfo> stages;
+    if (debug.stageCount) stages.assign(debug.pStages,debug.pStages+debug.stageCount);
+    std::vector<VkShaderModule> modules;
+    std::vector<std::unique_ptr<uint8_t[]>> debugChain;
+    std::vector<VkPipeline> libraries;
+    bool changed=false, supported=true;
+    for (auto& stage:stages) if (stage.stage==VK_SHADER_STAGE_FRAGMENT_BIT) {
+      std::vector<uint32_t> patched;
+      if (stage.module) {
+        auto it=d->previewShaders.find(stage.module);
+        if (it!=d->previewShaders.end()) patched=it->second;
+      } else if (stage.pNext && static_cast<const VkBaseInStructure*>(stage.pNext)->sType==VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) {
+        auto module=static_cast<const VkShaderModuleCreateInfo*>(stage.pNext);
+        patched=ffr::fragmentDebug(module->pCode,module->codeSize/4);
+        stage.pNext=module->pNext;
+      }
+      if (patched.empty()) { supported=false;break; }
+      VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      info.codeSize=patched.size()*4;info.pCode=patched.data();
+      VkShaderModule module{};
+      if (createModule(h,&info,nullptr,&module)!=VK_SUCCESS) { supported=false;break; }
+      modules.push_back(module);stage.module=module;changed=true;
+    }
+    if (supported && !patchFlags2(debug,debugChain,VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR)) supported=false;
+    if (supported) for (auto q=static_cast<const VkBaseInStructure*>(debug.pNext);q;q=q->pNext)
+      if (q->sType==VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR) {
+        auto lib=const_cast<VkPipelineLibraryCreateInfoKHR*>(reinterpret_cast<const VkPipelineLibraryCreateInfoKHR*>(q));
+        libraries.assign(lib->pLibraries,lib->pLibraries+lib->libraryCount);
+        for (auto& library:libraries) {
+          auto it=d->previewPipelines.find(library);
+          if (it!=d->previewPipelines.end()) { library=it->second;changed=true; }
+        }
+        lib->pLibraries=libraries.data();
+      }
+    if (supported && changed) supported=patchFlags2(debug,debugChain);
+    if (supported && changed) {
+      debug.flags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+      for (auto q=static_cast<const VkBaseInStructure*>(debug.pNext);q;q=q->pNext)
+        if (q->sType==VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR)
+          const_cast<VkPipelineCreateFlags2CreateInfoKHR*>(reinterpret_cast<const VkPipelineCreateFlags2CreateInfoKHR*>(q))->flags &= ~VkPipelineCreateFlags2KHR(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
+      debug.pStages=stages.data();
+      // Separate one-pipeline call: resolve batch-relative derivative bases.
+      if (debug.basePipelineIndex>=0 && uint32_t(debug.basePipelineIndex)<i) debug.basePipelineHandle=out[debug.basePipelineIndex];
+      debug.basePipelineIndex=-1;
+      VkPipeline pipeline{};
+      auto status=forward(h,cache,1,&debug,nullptr,&pipeline);
+      if (status==VK_SUCCESS) {
+        d->previewPipelines.emplace(out[i],pipeline);
+        if (d->previewReports++<3) LOG("tile preview: hardware fragment-size pipeline ready");
+      } else if (d->previewFailures++<3) LOG("tile preview: pipeline unavailable (%d)",status);
+    } else if (!supported && d->previewFailures++<3) LOG("tile preview: unsupported shader interface; leaving pipeline unchanged");
+    for (auto module:modules) destroyModule(h,module,nullptr);
+  }
+  return result;
+}
+EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(VkDevice h,const VkShaderModuleCreateInfo* ci,const VkAllocationCallbacks* a,VkShaderModule* out) {
+  std::lock_guard<std::recursive_mutex> guard(lock);auto d=dev(h);
+  auto fn=reinterpret_cast<PFN_vkCreateShaderModule>(d->next(h,"vkCreateShaderModule"));
+  auto result=fn(h,ci,a,out);
+  if (result==VK_SUCCESS && d->tilePreview && d->enabled) {
+    auto code=ffr::fragmentDebug(ci->pCode,ci->codeSize/4);
+    if (!code.empty()) d->previewShaders.emplace(*out,std::move(code));
+  }
+  return result;
+}
+EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyShaderModule(VkDevice h,VkShaderModule module,const VkAllocationCallbacks* a) {
+  std::lock_guard<std::recursive_mutex> guard(lock);auto d=dev(h);
+  d->previewShaders.erase(module);
+  reinterpret_cast<PFN_vkDestroyShaderModule>(d->next(h,"vkDestroyShaderModule"))(h,module,a);
+}
+EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice h,VkPipeline pipeline,const VkAllocationCallbacks* a) {
+  std::lock_guard<std::recursive_mutex> guard(lock);auto d=dev(h);
+  auto fn=reinterpret_cast<PFN_vkDestroyPipeline>(d->next(h,"vkDestroyPipeline"));
+  auto it=d->previewPipelines.find(pipeline);
+  if (it!=d->previewPipelines.end()) { fn(h,it->second,nullptr);d->previewPipelines.erase(it); }
+  fn(h,pipeline,a);
+}
+EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer h,VkPipelineBindPoint point,VkPipeline pipeline) {
+  std::unique_lock<std::recursive_mutex> guard(lock);auto d=dev(h);
+  if (d->tilePreview && point==VK_PIPELINE_BIND_POINT_GRAPHICS) {
+    auto& c=d->commands[h];c.graphicsPipeline=pipeline;
+    auto it=d->previewPipelines.find(pipeline);
+    if ((c.fdmAttached || (c.inherited && c.depth)) && it!=d->previewPipelines.end()) {
+      pipeline=it->second;c.previewBound=true;
+    }
+  }
+  auto fn=reinterpret_cast<PFN_vkCmdBindPipeline>(d->next(d->handle,"vkCmdBindPipeline"));
+  guard.unlock();fn(h,point,pipeline);
 }
 EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue(VkDevice h, uint32_t family,
                                                    uint32_t index,
@@ -2314,6 +2463,10 @@ PFN_vkVoidFunction intercept(const char *n) {
   HOOK(vkCmdCopyImage2);
   HOOK(vkCmdResolveImage2);
   HOOK(vkCreateGraphicsPipelines);
+  HOOK(vkCreateShaderModule);
+  HOOK(vkDestroyShaderModule);
+  HOOK(vkDestroyPipeline);
+  HOOK(vkCmdBindPipeline);
   HOOK(vkGetDeviceQueue);
   HOOK(vkGetDeviceQueue2);
   HOOK(vkQueueSubmit);
@@ -2347,6 +2500,8 @@ vkGetDeviceProcAddr(VkDevice h, const char *n) {
   auto downstream = d->next(h, n);
   if (!downstream)
     return nullptr;
+  if (!d->tilePreview && (!strcmp(n,"vkCmdBindPipeline") || !strcmp(n,"vkCreateShaderModule") ||
+      !strcmp(n,"vkDestroyShaderModule") || !strcmp(n,"vkDestroyPipeline"))) return downstream;
   if (auto f = intercept(n))
     return f;
   return downstream;

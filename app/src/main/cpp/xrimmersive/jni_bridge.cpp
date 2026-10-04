@@ -46,14 +46,15 @@ extern "C" {
 JNIEXPORT jlong JNICALL
 Java_app_gamenative_ui_screen_xr_XrNative_nativeCreate(JNIEnv *env, jclass, jobject activity,
                                                        jint quadWidth, jint quadHeight, jfloat refreshRate, jint upscaler,
-                                                       jint eyeWidth, jint eyeHeight, jfloat sgsrSharpness, jfloat fovScale, jint fovBorder) {
+                                                       jint eyeWidth, jint eyeHeight, jfloat sgsrSharpness, jfloat fovScale, jint fovBorder, jboolean fxaa, jint ffrDebug) {
     JavaVM *vm = nullptr;
     env->GetJavaVM(&vm);
 
+    xrimmersive::vrPerformance.reset();
     auto *handle = new NativeHandle();
     handle->activityGlobalRef = env->NewGlobalRef(activity);
     handle->session = new xrimmersive::XrImmersiveSession();
-    handle->session->configure(quadWidth, quadHeight, refreshRate, upscaler, eyeWidth, eyeHeight, sgsrSharpness, fovScale, fovBorder);
+    handle->session->configure(quadWidth, quadHeight, refreshRate, upscaler, eyeWidth, eyeHeight, sgsrSharpness, fovScale, fovBorder, fxaa == JNI_TRUE, ffrDebug);
     handle->session->initialize(vm, handle->activityGlobalRef);
     {
         std::lock_guard<std::mutex> lock(gHandleMutex);
@@ -137,6 +138,19 @@ Java_app_gamenative_ui_screen_xr_XrNative_nativePollSnapshot(JNIEnv *env, jclass
     return snapshot.quickMenuClicked ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jstring JNICALL
+Java_app_gamenative_ui_screen_xr_XrNative_nativeVisibilityMask(JNIEnv *env,jclass,jlong ptr,jint eye,jint type,jint offset) {
+    std::lock_guard<std::mutex> lock(gHandleMutex);
+    auto *handle=LiveHandle(ptr);
+    const auto text=handle?handle->session->visibilityMasks.wire(eye,type,offset):"ERROR unavailable";
+    return env->NewStringUTF(text.c_str());
+}
+JNIEXPORT jint JNICALL
+Java_app_gamenative_ui_screen_xr_XrNative_nativeVisibilityRevision(JNIEnv *,jclass,jlong ptr) {
+    std::lock_guard<std::mutex> lock(gHandleMutex);
+    auto *handle=LiveHandle(ptr);
+    return handle?handle->session->visibilityMasks.revision():0;
+}
 JNIEXPORT jlong JNICALL
 Java_app_gamenative_ui_screen_xr_XrNative_nativeGetWindowsXrTime(JNIEnv *, jclass, jlong handlePtr) {
     std::lock_guard<std::mutex> lock(gHandleMutex);
@@ -170,8 +184,31 @@ Java_app_gamenative_ui_screen_xr_XrNative_nativeLocateWindowsViews(
 }
 
 JNIEXPORT jboolean JNICALL
+Java_app_gamenative_ui_screen_xr_XrNative_nativeLocateWindowsHand(
+    JNIEnv *env, jclass, jlong handlePtr, jlong time, jint hand, jboolean aim,
+    jfloatArray outPose, jintArray outFlags) {
+    if (env->GetArrayLength(outPose) < 13 || env->GetArrayLength(outFlags) < 2) return JNI_FALSE;
+    XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+    XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
+    {
+        std::lock_guard<std::mutex> lock(gHandleMutex);
+        auto *handle = LiveHandle(handlePtr);
+        if (!handle || !handle->session->locateWindowsHand(time, hand, aim, &location, &velocity)) return JNI_FALSE;
+    }
+    const auto &p = location.pose;
+    const auto &v = velocity;
+    const jfloat values[13] = {p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w,
+        p.position.x, p.position.y, p.position.z, v.linearVelocity.x, v.linearVelocity.y,
+        v.linearVelocity.z, v.angularVelocity.x, v.angularVelocity.y, v.angularVelocity.z};
+    const jint flags[2] = {static_cast<jint>(location.locationFlags), static_cast<jint>(v.velocityFlags)};
+    env->SetFloatArrayRegion(outPose, 0, 13, values);
+    env->SetIntArrayRegion(outFlags, 0, 2, flags);
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
 Java_app_gamenative_ui_screen_xr_XrNative_nativeWaitWindowsFrame(
-    JNIEnv *env, jclass, jlong handlePtr, jlong afterSerial, jint timeoutMs,
+    JNIEnv *env, jclass, jlong handlePtr, jlong afterSerial, jint timeoutMs, jlong productionBudgetNs,
     jlongArray outTiming, jfloatArray outViews, jfloatArray outInput, jintArray outFlags) {
     if (env->GetArrayLength(outTiming) < 12 || env->GetArrayLength(outViews) < 22 ||
         env->GetArrayLength(outInput) < 36 || env->GetArrayLength(outFlags) < 3) return JNI_FALSE;
@@ -186,7 +223,8 @@ Java_app_gamenative_ui_screen_xr_XrNative_nativeWaitWindowsFrame(
         handle->waiters.fetch_add(1);
     }
     const bool got = session->waitWindowsRuntimeSnapshot(
-        static_cast<uint64_t>(afterSerial), static_cast<uint32_t>(timeoutMs), &snapshot);
+        static_cast<uint64_t>(afterSerial), static_cast<uint32_t>(timeoutMs), &snapshot,
+        static_cast<int64_t>(productionBudgetNs));
     {
         std::lock_guard<std::mutex> lock(gHandleMutex);
         handle->waiters.fetch_sub(1);
@@ -286,6 +324,33 @@ Java_app_gamenative_ui_screen_xr_XrNative_nativeSetWindowsOverlayVisible(
     std::lock_guard<std::mutex> lock(gHandleMutex);
     auto *handle = LiveHandle(handlePtr);
     if (handle != nullptr) handle->session->setWindowsOverlayVisible(visible == JNI_TRUE);
+}
+
+JNIEXPORT jdoubleArray JNICALL
+Java_app_gamenative_ui_screen_xr_XrNative_nativePerformanceSnapshot(JNIEnv *env, jclass, jlong ptr) {
+    std::array<double,14> data{};
+    {
+        std::lock_guard<std::mutex> lock(gHandleMutex);
+        auto *handle=LiveHandle(ptr);
+        if(!handle) return nullptr;
+        data=handle->session->performanceSnapshot();
+    }
+    auto result=env->NewDoubleArray(data.size());
+    if(result) env->SetDoubleArrayRegion(result,0,data.size(),data.data());
+    return result;
+}
+JNIEXPORT void JNICALL
+Java_app_gamenative_ui_screen_xr_XrNative_nativeSubmitPerformanceBitmap(JNIEnv *env, jclass, jlong ptr, jobject bitmap) {
+    AndroidBitmapInfo info{};
+    if(AndroidBitmap_getInfo(env,bitmap,&info)!=ANDROID_BITMAP_RESULT_SUCCESS || info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888) return;
+    void *pixels=nullptr;
+    if(AndroidBitmap_lockPixels(env,bitmap,&pixels)!=ANDROID_BITMAP_RESULT_SUCCESS) return;
+    {
+        std::lock_guard<std::mutex> lock(gHandleMutex);
+        auto *handle=LiveHandle(ptr);
+        if(handle) handle->session->submitPerformanceBitmap(static_cast<const uint8_t*>(pixels),info.width,info.height,info.stride);
+    }
+    AndroidBitmap_unlockPixels(env,bitmap);
 }
 
 // Called from ImmersiveXrActivity's PixelCopy capture loop with the game's actual rendered

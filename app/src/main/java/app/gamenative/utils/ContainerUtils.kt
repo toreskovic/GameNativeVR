@@ -288,6 +288,9 @@ object ContainerUtils {
             xrFovBorder = container.xrFovBorder,
             xrUpscaler = container.xrUpscaler,
             xrSgsrSharpness = container.xrSgsrSharpness,
+            xrFfrDebug = container.xrFfrDebug,
+            xrFxaa = container.xrFxaa,
+            xrPackedTransport = container.xrPackedTransport,
             xrForceDisableMsaa = container.isXrForceDisableMsaa,
             xrFoveation = container.xrFoveation,
             sfCompatMode = container.sfCompatMode,
@@ -490,6 +493,9 @@ object ContainerUtils {
         container.xrFovBorder = containerData.xrFovBorder
         container.xrUpscaler = containerData.xrUpscaler
         container.xrSgsrSharpness = containerData.xrSgsrSharpness
+        container.xrFfrDebug = containerData.xrFfrDebug
+        container.xrFxaa = containerData.xrFxaa
+        container.xrPackedTransport = containerData.xrPackedTransport
         container.isXrForceDisableMsaa = containerData.xrForceDisableMsaa
         container.xrFoveation = containerData.xrFoveation
         container.sfCompatMode = containerData.sfCompatMode

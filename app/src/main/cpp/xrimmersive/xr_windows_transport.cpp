@@ -1,9 +1,11 @@
+#include "xr_performance.h"
 #include "xr_windows_transport.h"
 
 #include <android/log.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <poll.h>
 #include <errno.h>
 #include <algorithm>
 #include <cstddef>
@@ -176,7 +178,13 @@ WindowsFrameTransport::WindowsFrameTransport() {
     }
 }
 
-WindowsFrameTransport::~WindowsFrameTransport() { stop(); }
+WindowsFrameTransport::~WindowsFrameTransport() { stop(); setFrameWakeFd(-1); }
+bool WindowsFrameTransport::setFrameWakeFd(int fd) {
+    std::lock_guard<std::mutex> lock(eyesMutex_);
+    if (frameWakeFd_ >= 0) close(frameWakeFd_);
+    frameWakeFd_ = fd >= 0 ? dup(fd) : -1;
+    return fd < 0 || frameWakeFd_ >= 0;
+}
 
 void WindowsFrameTransport::start(const std::string& socketPath) {
     bool expected = false;
@@ -256,7 +264,7 @@ void WindowsFrameTransport::serviceClient(int clientFd) {
     while (running_.load() && readLine(clientFd, line)) {
         if (line.rfind("HELLO", 0) == 0) {
             writeAll(clientFd, "OK GameNativeVR 2\n", 18);
-        } else if (line.rfind("BUFFER", 0) == 0) {
+        } else if ((line.rfind("BUFFER", 0) == 0 || line.rfind("PROBE_BUFFER", 0) == 0)) {
             if (!handleBufferLine(clientFd, line)) {
                 writeAll(clientFd, "ERR buffer\n", 11);
                 return;
@@ -285,8 +293,14 @@ bool WindowsFrameTransport::handleBufferLine(int clientFd, const std::string& li
     long long w = parseKey(line, "w", 0);
     long long h = parseKey(line, "h", 0);
     const bool swapRedBlue = parseKey(line, "swizzle", 0) != 0;
+    const long long layer = parseKey(line, "layer", 0);
+    const long long packing = parseKey(line, "packing", 0);
+    if (packing < 0 || packing > 1) return writeAll(clientFd, "ERR unsupported\n", 16);
+    const bool probe = line.rfind("PROBE_BUFFER", 0) == 0;
+    if (probe && !probeHardwareBuffer) return writeAll(clientFd, "ERR unsupported\n", 16);
+    if (layer < 0 || layer > 1) return writeAll(clientFd, "ERR unsupported\n", 16);
     if (eye < 0 || eye >= kEyeCount || index < 0 || index >= kMaxImages ||
-        w <= 0 || h <= 0) {
+        w <= 0 || h <= 0 || w > 16384 || h > 16384) {
         LOGE("xr transport: bad BUFFER line: %s", line.c_str());
         return false;
     }
@@ -299,9 +313,20 @@ bool WindowsFrameTransport::handleBufferLine(int clientFd, const std::string& li
         return false;
     }
 
+    if (probe) {
+        EyeFrame frame;
+        frame.kind = BufferKind::HardwareBuffer; frame.buffer = ahb;
+        frame.width = static_cast<int32_t>(w); frame.height = static_cast<int32_t>(h);
+        frame.bufferLayer = static_cast<uint32_t>(layer);
+        frame.foveatedPacked = packing == 1;
+        const bool accepted = probeHardwareBuffer(frame);
+        AHardwareBuffer_release(ahb);
+        LOGI("Shared eye AHB import probe: %s size=%lldx%lld layer=%lld", accepted ? "accepted" : "rejected", w, h, layer);
+        return accepted ? writeAll(clientFd, "OK stored\n", 10) : writeAll(clientFd, "ERR unsupported\n", 16);
+    }
     storeEyeBuffer(static_cast<int>(eye), ahb,
                    static_cast<int32_t>(w), static_cast<int32_t>(h),
-                   static_cast<int32_t>(index), swapRedBlue);
+                   static_cast<int32_t>(index), swapRedBlue, static_cast<uint32_t>(layer), packing == 1);
     LOGI("xr transport: received eye %lld AHB buffer %lldx%lld index=%lld", eye, w, h, index);
     return writeAll(clientFd, "OK stored\n", 10);
 }
@@ -389,13 +414,18 @@ bool WindowsFrameTransport::handleFrameLine(int clientFd, const std::string& lin
             writeAll(clientFd, "ERR rect\n", 9);
             return true;
         }
-        if (latest_[eye].acquireFenceFd >= 0) {
-            ::close(latest_[eye].acquireFenceFd);
-        }
-        if (latest_[eye].kind != BufferKind::None && !latestClaimed_[eye]) {
-            const int dropped = latest_[eye].imageIndex;
-            if (dropped >= 0 && dropped < kMaxImages &&
-                releasePending_[eye][dropped]) {
+        forgetPendingImageLocked(eye, static_cast<int>(index));
+        if ((hasFence || !pending_[eye].empty()) && latest_[eye].kind != BufferKind::None &&
+            !latestClaimed_[eye] && latest_[eye].imageIndex != index) {
+            // Preserve the previous candidate until a newer pair is selected.
+            // Moving metadata also transfers ownership of its acquire FD.
+            pending_[eye].push_back(latest_[eye]);
+            latest_[eye] = EyeFrame{};
+            while (pending_[eye].size() > kPendingFrames) dropPendingLocked(eye, 0);
+        } else {
+            if (latest_[eye].acquireFenceFd >= 0) ::close(latest_[eye].acquireFenceFd);
+            if (latest_[eye].kind != BufferKind::None && !latestClaimed_[eye]) {
+                const int dropped = latest_[eye].imageIndex;
                 releasePending_[eye][dropped] = false;
                 if (releaseFenceFds_[eye][dropped] >= 0) {
                     ::close(releaseFenceFds_[eye][dropped]);
@@ -439,12 +469,24 @@ bool WindowsFrameTransport::handleFrameLine(int clientFd, const std::string& lin
         latest_[eye].serial = nextSerial_++;
         latest_[eye].frameId = static_cast<uint64_t>(parseKey(line, "frame", 0));
         latest_[eye].targetDisplayTime = parseKey(line, "target", 0);
+        latest_[eye].receivedAt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
         latestClaimed_[eye] = false;
         if (releaseFenceFds_[eye][index] >= 0) {
             ::close(releaseFenceFds_[eye][index]);
             releaseFenceFds_[eye][index] = -1;
         }
         releasePending_[eye][index] = true;
+        if (latest_[0].frameId && latest_[0].frameId == latest_[1].frameId) {
+            vrPerformance.game(latest_[0].frameId);
+            const auto interval = arrivalCadence_.observe(
+                latest_[0].frameId, std::max(latest_[0].receivedAt, latest_[1].receivedAt));
+            latest_[0].arrivalInterval = latest_[1].arrivalInterval = interval;
+            if (frameWakeFd_ >= 0) {
+                const uint64_t one = 1;
+                (void)::write(frameWakeFd_, &one, sizeof(one));
+            }
+        }
     }
     releaseCv_.notify_all();
     return writeAll(clientFd, hasFence ? "OK stored\n" : "OK\n",
@@ -493,6 +535,7 @@ bool WindowsFrameTransport::handleAcquireLine(int clientFd, const std::string& l
 
 
 void WindowsFrameTransport::releaseSlotLocked(int eye, int imageIndex) {
+    forgetPendingImageLocked(eye, imageIndex);
     EyeFrame& slot = buffers_[eye][imageIndex];
     if (slot.kind == BufferKind::HardwareBuffer && slot.buffer != nullptr) {
         AHardwareBuffer_release(slot.buffer);
@@ -512,7 +555,7 @@ void WindowsFrameTransport::releaseSlotLocked(int eye, int imageIndex) {
 
 void WindowsFrameTransport::storeEyeBuffer(int eye, AHardwareBuffer* ahb,
                                     int32_t w, int32_t h, int32_t index,
-                                    bool swapRedBlue) {
+                                    bool swapRedBlue, uint32_t layer, bool packed) {
     std::lock_guard<std::mutex> lock(eyesMutex_);
     if (latest_[eye].kind != BufferKind::None &&
         latest_[eye].imageIndex == index) {
@@ -526,6 +569,8 @@ void WindowsFrameTransport::storeEyeBuffer(int eye, AHardwareBuffer* ahb,
     slot.kind = BufferKind::HardwareBuffer;
     slot.buffer = ahb;
     slot.swapRedBlue = swapRedBlue;
+    slot.foveatedPacked = packed;
+    slot.bufferLayer = layer;
     slot.width = w;
     slot.height = h;
     slot.imageIndex = index;
@@ -548,6 +593,8 @@ void WindowsFrameTransport::storeEyeDmabuf(int eye, const EyeFrame& incoming) {
 
 void WindowsFrameTransport::releaseEye(int eye) {
     std::lock_guard<std::mutex> lock(eyesMutex_);
+    arrivalCadence_ = {};
+    while (!pending_[eye].empty()) dropPendingLocked(eye, 0);
     if (latest_[eye].acquireFenceFd >= 0) {
         ::close(latest_[eye].acquireFenceFd);
     }
@@ -561,6 +608,8 @@ void WindowsFrameTransport::releaseEye(int eye) {
 
 void WindowsFrameTransport::resetEye(int eye) {
     std::lock_guard<std::mutex> lock(eyesMutex_);
+    arrivalCadence_ = {};
+    while (!pending_[eye].empty()) dropPendingLocked(eye, 0);
     if (latest_[eye].acquireFenceFd >= 0) {
         ::close(latest_[eye].acquireFenceFd);
     }
@@ -588,31 +637,80 @@ void WindowsFrameTransport::dropRetainedLocked(int eye) {
     held = EyeFrame{};
 }
 
-bool WindowsFrameTransport::pollStereo(std::array<EyeFrame, 2> &frames) {
+void WindowsFrameTransport::dropPendingLocked(int eye, size_t index) {
+    const EyeFrame old = pending_[eye][index];
+    if (old.acquireFenceFd >= 0) ::close(old.acquireFenceFd);
+    pending_[eye].erase(pending_[eye].begin() + index);
+    if (latest_[eye].kind == BufferKind::None || latest_[eye].imageIndex != old.imageIndex) {
+        releasePending_[eye][old.imageIndex] = false;
+        if (releaseFenceFds_[eye][old.imageIndex] >= 0) {
+            ::close(releaseFenceFds_[eye][old.imageIndex]);
+            releaseFenceFds_[eye][old.imageIndex] = -1;
+        }
+    }
+}
+
+void WindowsFrameTransport::forgetPendingImageLocked(int eye, int imageIndex) {
+    for (size_t i = 0; i < pending_[eye].size();) {
+        if (pending_[eye][i].imageIndex == imageIndex) dropPendingLocked(eye, i);
+        else ++i;
+    }
+}
+
+bool WindowsFrameTransport::pollStereo(std::array<EyeFrame, 2> &frames, bool readyOnly) {
     std::lock_guard<std::mutex> lock(eyesMutex_);
-    // FRAME messages arrive separately. Do not expose a partial update, or claim
-    // fences until both eyes are ready. The last OpenXR image covers this interval.
-    if (latest_[0].kind == BufferKind::None || latest_[1].kind == BufferKind::None ||
-        latestClaimed_[0] || latestClaimed_[1] ||
-        latest_[0].frameId == 0 || latest_[0].frameId != latest_[1].frameId)
-        return false;
+    const auto ready = [readyOnly](const EyeFrame &eye) {
+        if (eye.kind == BufferKind::None || !eye.frameId) return false;
+        if (!readyOnly || eye.acquireFenceFd < 0) return true;
+        pollfd fd{eye.acquireFenceFd, POLLIN, 0};
+        return poll(&fd, 1, 0) > 0 && (fd.revents & POLLIN) &&
+               !(fd.revents & (POLLERR | POLLNVAL));
+    };
+    // At most five candidates per eye. Choose a matching ready pair without
+    // claiming newer unfinished images or queuing waits on the XR device.
+    EyeFrame *chosen[2]{};
+    for (size_t l = 0; l <= pending_[0].size(); ++l) {
+        EyeFrame *left = l == pending_[0].size() ?
+            (latestClaimed_[0] ? nullptr : &latest_[0]) : &pending_[0][l];
+        if (!left || !ready(*left)) continue;
+        for (size_t r = 0; r <= pending_[1].size(); ++r) {
+            EyeFrame *right = r == pending_[1].size() ?
+                (latestClaimed_[1] ? nullptr : &latest_[1]) : &pending_[1][r];
+            if (right && right->frameId == left->frameId && ready(*right) &&
+                (!chosen[0] || left->frameId > chosen[0]->frameId)) {
+                chosen[0] = left; chosen[1] = right;
+            }
+        }
+    }
+    if (!chosen[0]) return false;
+    const uint64_t selected = chosen[0]->frameId;
     for (int eye = 0; eye < kEyeCount; ++eye) {
-        EyeFrame snapshot = latest_[eye];
-        latest_[eye].acquireFenceFd = -1;
-        latestClaimed_[eye] = true;
+        EyeFrame snapshot = *chosen[eye];
+        chosen[eye]->acquireFenceFd = -1;
+        if (chosen[eye] == &latest_[eye]) latestClaimed_[eye] = true;
+        else {
+            for (size_t i = 0; i < pending_[eye].size(); ++i)
+                if (&pending_[eye][i] == chosen[eye]) {
+                    pending_[eye].erase(pending_[eye].begin() + i);
+                    break; // Ownership transfers to the consumer, not to reuse.
+                }
+        }
         dropRetainedLocked(eye);
         if (snapshot.kind == BufferKind::HardwareBuffer && snapshot.buffer != nullptr) {
             AHardwareBuffer_acquire(snapshot.buffer);
         } else if (snapshot.kind == BufferKind::DmaBuf) {
-            for (int plane = 0; plane < snapshot.planeCount; ++plane) {
-                snapshot.dmabufFds[plane] =
-                    snapshot.dmabufFds[plane] >= 0 ? ::dup(snapshot.dmabufFds[plane]) : -1;
-            }
+            for (int plane = 0; plane < snapshot.planeCount; ++plane)
+                snapshot.dmabufFds[plane] = snapshot.dmabufFds[plane] >= 0 ? ::dup(snapshot.dmabufFds[plane]) : -1;
         }
         retained_[eye] = snapshot;
         retained_[eye].acquireFenceFd = -1;
         frames[eye] = snapshot;
+        for (size_t i = 0; i < pending_[eye].size();) {
+            if (pending_[eye][i].frameId <= selected) dropPendingLocked(eye, i);
+            else ++i;
+        }
     }
+    releaseCv_.notify_all();
     return true;
 }
 

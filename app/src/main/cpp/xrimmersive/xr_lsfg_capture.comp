@@ -1,0 +1,43 @@
+#version 450
+layout(local_size_x=8, local_size_y=8) in;
+layout(constant_id=1) const bool packedInput=false;
+layout(binding=0) uniform sampler2D source;
+layout(binding=1, rgba8) writeonly uniform image2D alignedImage;
+layout(binding=2, rgba8) writeonly uniform image2D realImage;
+layout(push_constant) uniform Parameters {
+    vec4 crop;
+    vec4 rotation[3];
+    vec4 sourceFov;
+    vec4 targetFov;
+    ivec4 flags; // warp, capture real, swap red/blue, reserved
+    vec4 packing; // normalized low cuts, logical/physical scales
+} p;
+vec4 sampleEye(vec2 uv) {
+    vec2 halfTexel=0.5/(packedInput ? vec2(p.rotation[0].w,p.rotation[1].w) : vec2(textureSize(source,0)));
+    vec2 lo=min(p.crop.xy,p.crop.xy+p.crop.zw)+halfTexel;
+    vec2 hi=max(p.crop.xy,p.crop.xy+p.crop.zw)-halfTexel;
+    vec2 coord=clamp(p.crop.xy+uv*p.crop.zw,lo,hi);
+    if(packedInput) {
+        coord=(0.5*coord+0.5*clamp(coord-p.packing.xy,vec2(0),1.0-2.0*p.packing.xy))*p.packing.zw;
+    }
+    vec4 c=textureLod(source,coord,0.0);
+    return p.flags.z!=0 ? c.bgra : c;
+}
+void main() {
+    ivec2 pixel=ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size=imageSize(alignedImage);
+    if(any(greaterThanEqual(pixel,size))) return;
+    vec2 uv=(vec2(pixel)+0.5)/vec2(size);
+
+    vec2 aligned=uv;
+    if(p.flags.x!=0) {
+        mat3 rotation=mat3(p.rotation[0].xyz,p.rotation[1].xyz,p.rotation[2].xyz);
+        vec3 ray=rotation*vec3(mix(p.targetFov.x,p.targetFov.y,uv.x),mix(p.targetFov.z,p.targetFov.w,uv.y),-1.0);
+        vec2 t=ray.xy/max(-ray.z,0.0001);
+        aligned=(t-p.sourceFov.xz)/(p.sourceFov.yw-p.sourceFov.xz);
+    }
+    vec4 alignedColor=sampleEye(aligned);
+    imageStore(alignedImage,pixel,alignedColor);
+
+    if(p.flags.y!=0) imageStore(realImage,pixel,p.flags.x!=0 ? sampleEye(uv) : alignedColor);
+}

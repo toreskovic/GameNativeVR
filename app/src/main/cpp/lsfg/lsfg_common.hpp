@@ -23,8 +23,15 @@ constexpr VkFormat LSFG_FLOW_FORMAT = VK_FORMAT_R8_UNORM;
 constexpr VkFormat LSFG_MOTION_FORMAT = VK_FORMAT_R16G16B16A16_SFLOAT;
 
 constexpr size_t LSFG_HISTORY_SLOTS = 3;
+// XR has one midpoint and one output per eye. Do not allocate descriptor sets
+// and uniform buffers for unused 3x/4x or flat swapchain targets in that build.
+#ifdef LSFG_STEREO_2X
+constexpr size_t LSFG_MAX_TARGETS = 1;
+constexpr size_t LSFG_MAX_GENERATIONS = 1;
+#else
 constexpr size_t LSFG_MAX_TARGETS = 7;
 constexpr size_t LSFG_MAX_GENERATIONS = 3;
+#endif
 constexpr size_t LSFG_MIP_LEVELS = 7;
 
 constexpr size_t LSFG_GENERATION_SLOTS = LSFG_MAX_GENERATIONS * (LSFG_MAX_GENERATIONS + 1) / 2;
@@ -67,6 +74,8 @@ public:
         return device;
     }
 
+    [[nodiscard]] VkPhysicalDevice PhysicalHandle() const { return physical_device; }
+
     [[nodiscard]] uint32_t FindMemoryType(uint32_t bits, VkMemoryPropertyFlags properties) const;
 
 private:
@@ -78,7 +87,7 @@ private:
 class Buffer {
 public:
     Buffer() = default;
-    Buffer(const Device& device, VkDeviceSize size);
+    Buffer(const Device& device, VkDeviceSize size, VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     ~Buffer();
 
     Buffer(const Buffer&) = delete;
@@ -109,6 +118,8 @@ class LsfgImage {
 public:
     LsfgImage() = default;
     LsfgImage(const Device& device, VkExtent2D extent, VkFormat format = LSFG_DEFAULT_FORMAT);
+    // Borrowed image/view; caller owns their lifetime and cross-API synchronization.
+    LsfgImage(VkImage image, VkImageView view, VkExtent2D extent, VkFormat format);
     ~LsfgImage();
 
     LsfgImage(const LsfgImage&) = delete;

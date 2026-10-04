@@ -61,11 +61,11 @@ uint32_t Device::FindMemoryType(uint32_t bits, VkMemoryPropertyFlags properties)
     return UINT32_MAX;
 }
 
-Buffer::Buffer(const Device& device_, VkDeviceSize size) : device{device_.Handle()} {
+Buffer::Buffer(const Device& device_, VkDeviceSize size, VkBufferUsageFlags usage) : device{device_.Handle()} {
     VkBufferCreateInfo buffer_ci{};
     buffer_ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer_ci.size = size;
-    buffer_ci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    buffer_ci.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     buffer_ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (vkd.CreateBuffer(device, &buffer_ci, nullptr, &buffer) != VK_SUCCESS) {
         buffer = VK_NULL_HANDLE;
@@ -186,6 +186,9 @@ LsfgImage::LsfgImage(const Device& device_, VkExtent2D extent_, VkFormat format_
         Release();
     }
 }
+
+LsfgImage::LsfgImage(VkImage image_, VkImageView view_, VkExtent2D extent_, VkFormat format_)
+    : image{image_}, view{view_}, extent{extent_}, format{format_}, layout{VK_IMAGE_LAYOUT_GENERAL} {}
 
 LsfgImage::~LsfgImage() {
     Release();

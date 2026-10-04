@@ -312,7 +312,8 @@ object LsfgVkManager {
         rendererRef = WeakReference(renderer)
         appContext = context.applicationContext
         val multiplier = multiplier(container)
-        val enabled = isArmed(container) && isNativeBackend(container) && multiplier >= 2
+        val enabled = isArmed(container) && isNativeBackend(container) && multiplier >= 2 &&
+            !parseBool(container.getExtra("windowsVrEnabled", "false"))
 
         renderer.setFrameGenerationMode(
             multiplier.coerceAtLeast(2),
@@ -498,7 +499,8 @@ object LsfgVkManager {
         envVars.remove(ENV_CONFIG)
         envVars.remove(ENV_PROCESS)
 
-        if (!isSupported(container)) {
+        if (!isSupported(container) || parseBool(container.getExtra("windowsVrEnabled", "false"))) {
+            // VR generation runs on the stereo presenter, never on the mirror swapchain.
             // Remove the manifest so the Vulkan loader can't find the layer
             disableLayerInContainer(container)
             return false

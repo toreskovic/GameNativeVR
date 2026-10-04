@@ -1,0 +1,74 @@
+#version 450
+// One invocation per 8x8 motion block. Coarse prediction selection and bounded
+// refinement share a dispatch, avoiding a materialized scaled-motion image.
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform usampler2D firstLuma;
+layout(binding=1) uniform usampler2D secondLuma;
+layout(binding=2,rg32i) writeonly uniform iimage2D outFlow;
+layout(binding=3) uniform isampler2D coarseFlow;
+layout(push_constant) uniform Params { ivec4 size; } p;
+uint source[16];
+ivec2 origin, limit;
+int taps, stride;
+uint cost(ivec2 motion) {
+    uint result=0u;
+    for(int i=0;i<taps;++i) {
+        ivec2 offset=ivec2(i%stride,i/stride)*(stride==4?2:4)+ivec2(1);
+        uint target=texelFetch(secondLuma,clamp(origin+offset+motion,ivec2(0),limit),0).r;
+        result+=uint(abs(int(source[i])-int(target)));
+    }
+    return result;
+}
+void main() {
+    ivec2 block=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(block,imageSize(outFlow)))) return;
+    origin=block*8; limit=textureSize(firstLuma,0)-1;
+    // Full-quality radius matches game FFR, SGSR and AA.
+    // Fixed symmetric ellipse in each eye. These are fractions of the image's
+    // half-width/height, not percentages of its area or gaze-tracked regions.
+    vec2 position=(vec2(origin)+4.0)/vec2(limit+1)*2.0-1.0;
+    float radius=length(position);
+    bool central=radius<=0.48;
+    // Peripheral blocks still receive the coarse search and intermediate-level
+    // refinement. Only the finest refinement is omitted in the outer region.
+    if(p.size.z==0 && radius>=0.75) {
+        ivec2 predicted=texelFetch(coarseFlow,min(block/2,textureSize(coarseFlow,0)-1),0).xy*2;
+        imageStore(outFlow,block,ivec4(predicted,0,0));
+        return;
+    }
+    stride=central?4:2; taps=stride*stride;
+    for(int i=0;i<taps;++i) {
+        ivec2 offset=ivec2(i%stride,i/stride)*(stride==4?2:4)+ivec2(1);
+        source[i]=texelFetch(firstLuma,min(origin+offset,limit),0).r;
+    }
+    ivec2 coarseLimit=textureSize(coarseFlow,0)-1;
+    ivec2 parent=block/2;
+    ivec2 best=texelFetch(coarseFlow,min(parent,coarseLimit),0).xy*2;
+    uint bestCost=cost(best), good=uint(taps)*2u;
+    // Coarse blocks can miss small independent motion. Keep the zero-motion
+    // candidate so bounded refinement is not trapped around a bad large vector.
+    if(bestCost>good && any(notEqual(best,ivec2(0)))) {
+        uint stationaryCost=cost(ivec2(0));
+        if(stationaryCost<bestCost) { best=ivec2(0); bestCost=stationaryCost; }
+    }
+    // A sufficiently good parent match avoids both predictor and local searches.
+    if(bestCost>good) {
+        ivec2 side=ivec2((block.x&1)==0?-1:1,(block.y&1)==0?-1:1);
+        for(int i=0;i<3 && bestCost>good;++i) {
+            ivec2 offset=i==0?ivec2(side.x,0):i==1?ivec2(0,side.y):side;
+            ivec2 candidate=texelFetch(coarseFlow,clamp(parent+offset,ivec2(0),coarseLimit),0).xy*2;
+            uint error=cost(candidate);
+            if(error<bestCost) { best=candidate; bestCost=error; }
+        }
+        // At most eight neighboring offsets centrally, four in the periphery.
+        // Always search around the selected predictor, never an unbounded walk.
+        ivec2 predictor=best;
+        const ivec2 offsets[8]=ivec2[8](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1),
+            ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1),ivec2(1,1));
+        for(int i=0;i<(central?8:4) && bestCost>good;++i) {
+            ivec2 candidate=predictor+offsets[i]; uint error=cost(candidate);
+            if(error<bestCost) { best=candidate; bestCost=error; }
+        }
+    }
+    imageStore(outFlow,block,ivec4(best,0,0));
+}

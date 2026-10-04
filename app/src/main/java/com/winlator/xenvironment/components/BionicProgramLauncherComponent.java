@@ -402,7 +402,7 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
             LsfgVkManager.ensureRuntimeInstalled(environment.getContext(), container);
             LsfgVkManager.writeConfig(container);
             LsfgVkManager.applyLaunchEnv(container, envVars);
-            if (LsfgVkManager.isArmed(container)) {
+            if (LsfgVkManager.isArmed(container) && !"true".equals(container.getExtra("windowsVrEnabled", "false"))) {
                 final android.content.Context lsfgContext = environment.getContext();
                 new Thread(() -> LsfgVkManager.prepareNativeCache(lsfgContext, container),
                     "lsfg-native-cache").start();

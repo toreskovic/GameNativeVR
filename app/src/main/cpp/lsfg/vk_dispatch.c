@@ -14,6 +14,7 @@ bool vkd_load(VkInstance instance, VkDevice device, PFN_vkGetInstanceProcAddr gi
     LOAD_I(DestroyInstance);
     LOAD_I(EnumeratePhysicalDevices);
     LOAD_I(GetPhysicalDeviceProperties);
+    LOAD_I(GetPhysicalDeviceProperties2);
     LOAD_I(GetPhysicalDeviceMemoryProperties);
     LOAD_I(GetPhysicalDeviceFeatures2);
     LOAD_I(GetPhysicalDeviceQueueFamilyProperties);

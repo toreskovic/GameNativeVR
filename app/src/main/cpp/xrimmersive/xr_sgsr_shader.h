@@ -130,18 +130,18 @@ void main()
     vec4 inputColor = textureLod(ps0, center, 0.0);
     vec4 color = inputColor;
 
-    // Eye-local ellipse, independent of scene FFR: 38% SGSR region, 2% smooth
-    // transition, 60% pure bilinear by image area. Squared-radius thresholds
-    // are 4*area/pi for normalized coordinates in [-1,1]^2.
+    // Full quality through radius 0.45, fading out at 0.47 (17.3% area).
+    // The inset leaves room for neighboring taps in the packed center.
+    // Coordinates are normalized to each eye half-extent.
     highp vec2 eyeSize = vec2(eyeBounds.zw - eyeBounds.xy + ivec2(1));
     highp vec2 eyePosition = (uv * ViewportInfo[0].zw - vec2(eyeBounds.xy)) / eyeSize;
     highp vec2 radial = eyePosition * 2.0 - 1.0;
     highp float radiusSquared = dot(radial, radial);
-    float sgsrWeight = (1.0 - smoothstep(0.4838310270, 0.5092958179, radiusSquared))
+    float sgsrWeight = (1.0 - smoothstep(0.2025, 0.2209, radiusSquared))
         * min(sgsrSharpness, 1.0);
 
-    // Skip SGSR gathers/filter work entirely in the outer 60% of each eye.
-    if (mode != 4 && radiusSquared < 0.5092958179)
+    // Skip SGSR gathers/filter work entirely outside radius 0.47.
+    if (mode != 4 && radiusSquared < 0.2209)
 	{
 		highp vec2 imgCoord = ((uv*ViewportInfo[0].zw)+vec2(-0.5,0.5));
 		highp vec2 imgCoordPixel = floor(imgCoord);

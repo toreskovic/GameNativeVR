@@ -2725,6 +2725,13 @@
     <string name="xr_upscaler_sgsr_edge">SGSR 1 (edge direction)</string>
     <string name="xr_upscaler_off">Off (bilinear)</string>
     <string name="xr_upscaler_desc">Upscale immersive VR using the VR resolution scale above. Set it below 100% to use SGSR. Restart the game to apply.</string>
+    <string name="xr_ffr_debug">FFR debugging</string>
+    <string name="xr_ffr_debug_game">Game FFR tiles</string>
+    <string name="xr_ffr_debug_post">SGSR / AA regions</string>
+    <string name="xr_visibility_debug">Visibility mask (magenta hidden area)</string>
+    <string name="xr_ffr_debug_desc">Blend region colors over the game. Game: driver-reported fragment sizes in foveated passes, blue 1×1, yellow up to 2×2, red coarser. Later game effects can alter the tint. SGSR / AA: blue center, red periphery. Disabled effects are not tinted. Visibility mask: magenta marks the area excluded from presentation. Restart the game to apply.</string>
+    <string name="xr_fxaa">Lightweight AA</string>
+    <string name="xr_fxaa_desc">Smooth central-view jagged edges with a lightweight filter, with or without SGSR. May soften fine details. Restart the game to apply.</string>
     <string name="xr_force_disable_msaa">Force disable MSAA</string>
     <string name="xr_force_disable_msaa_desc">Disable multisample anti-aliasing for better VR performance. Applies to DXVK games after restarting.</string>
     <string name="xr_ffr_title">VR Fixed Foveated Rendering (experimental)</string>
@@ -2741,4 +2748,6 @@
     <string name="xr_fov_extend">Extend</string>
     <string name="xr_fov_blurred">Blurred</string>
     <string name="xr_fov_border_desc">Below 100% FOV, leave the border black or fill it using edge colors. Blurred softens the fill; neither fill restores missing scenery. Restart the game to apply.</string>
+    <string name="xr_packed_transport">VR packed transport (experimental)</string>
+    <string name="xr_packed_transport_desc">Reduce peripheral image detail to save transfer bandwidth. Performance varies by game. Requires restarting the game.</string>
 </resources>

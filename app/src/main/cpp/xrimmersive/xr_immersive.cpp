@@ -1,3 +1,8 @@
+#include <sys/system_properties.h>
+#include "xr_performance.h"
+#include "xr_frame_pacing.h"
+#include "xr_vulkan_diagnostic.h"
+#include "xr_lsfg_capture.h"
 #include "xr_immersive.h"
 
 #include <android/log.h>
@@ -80,14 +85,32 @@ InputSnapshot XrImmersiveSession::pollSnapshot() {
 }
 
 bool XrImmersiveSession::waitWindowsRuntimeSnapshot(uint64_t afterSerial, uint32_t timeoutMs,
-                                                     WindowsRuntimeSnapshot *snapshot) {
+                                                     WindowsRuntimeSnapshot *snapshot,
+                                                     int64_t productionBudgetNs) {
     if (snapshot == nullptr) return false;
     std::unique_lock<std::mutex> lock(windowsSnapshotMutex_);
-    windowsSnapshotCondition_.wait_for(
-        lock, std::chrono::milliseconds(timeoutMs),
-        [this, afterSerial] { return windowsSnapshot_.frameSerial > afterSerial || stopRequested_.load(); });
-    if (windowsSnapshot_.frameSerial <= afterSerial) return false;
+    windowsSnapshotCondition_.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+        [this, afterSerial, productionBudgetNs] {
+            return stopRequested_.load() || (windowsSnapshot_.frameSerial > afterSerial &&
+                (productionBudgetNs < 0 || windowsFrameAdmissionOpen_));
+        });
+    if (stopRequested_.load() || windowsSnapshot_.frameSerial <= afterSerial ||
+        (productionBudgetNs >= 0 && !windowsFrameAdmissionOpen_)) return false;
     *snapshot = windowsSnapshot_;
+    if (productionBudgetNs >= 0 && snapshot->shouldRender) {
+        snapshot->predictedDisplayTime = guestDisplayTarget(snapshot->predictedDisplayTime,
+            snapshot->predictedDisplayPeriod, currentWindowsXrTime(), productionBudgetNs,
+            windowsGuestTarget_);
+        windowsGuestTarget_ = snapshot->predictedDisplayTime;
+    }
+    lock.unlock();
+    if (productionBudgetNs >= 0 && snapshot->shouldRender) {
+        // FRAME_SYNC's cached eye poses follow its target too. Buttons remain the
+        // latest xrSyncActions sample; explicit head/hand queries still locate at
+        // the application's requested time through their existing fast path.
+        if (!locateWindowsViews(snapshot->predictedDisplayTime, &snapshot->views,
+                                &snapshot->viewStateFlags)) snapshot->viewStateFlags = 0;
+    }
     return true;
 }
 
@@ -106,6 +129,21 @@ bool XrImmersiveSession::locateWindowsViews(XrTime time, std::array<XrView, 2> *
         return false;
     *flags = state.viewStateFlags;
     return true;
+}
+
+bool XrImmersiveSession::locateWindowsHand(XrTime time, uint32_t hand, bool aim,
+                                          XrSpaceLocation *location, XrSpaceVelocity *velocity) {
+    std::lock_guard<std::mutex> lock(windowsLocateMutex_);
+    if (!windowsViewsReady_ || time <= 0 || hand > 1 || stopRequested_.load()) return false;
+    const XrSpace space = aim ? (hand ? aimSpaceRight_ : aimSpaceLeft_)
+                              : (hand ? gripSpaceRight_ : gripSpaceLeft_);
+    if (space == XR_NULL_HANDLE) return false;
+    *velocity = {XR_TYPE_SPACE_VELOCITY};
+    *location = {XR_TYPE_SPACE_LOCATION};
+    location->next = velocity;
+    // Locate the already-synchronized action space; do not resync actions here.
+    // Button edges and active action sets retain the game's frame-sync semantics.
+    return XR_SUCCEEDED(xrLocateSpace(space, windowsTrackingSpace_, time, location));
 }
 
 bool XrImmersiveSession::windowsStereoActive() const {
@@ -151,16 +189,19 @@ void XrImmersiveSession::submitFrame(const uint8_t *rgbaPixels, int32_t width, i
     pendingFrameWidth_ = width;
     pendingFrameHeight_ = height;
     hasPendingFrame_ = true;
+    ++vulkanBitmapVersion_;
 }
 
 void XrImmersiveSession::configure(int32_t quadWidth, int32_t quadHeight, float refreshRate, int upscaler,
-                                     int32_t eyeWidth, int32_t eyeHeight, float sgsrSharpness, float fovScale, int fovBorder) {
+                                     int32_t eyeWidth, int32_t eyeHeight, float sgsrSharpness, float fovScale, int fovBorder, bool fxaa, int ffrDebug) {
     if (quadWidth > 0 && quadHeight > 0) {
         swapchainWidth_ = quadWidth;
         swapchainHeight_ = quadHeight;
     }
     if (refreshRate > 0.0f) requestedRefreshRate_ = refreshRate;
     upscaler_ = upscaler;
+    fxaa_ = fxaa;
+    ffrDebug_ = std::clamp(ffrDebug,0,3);
     sgsrSharpness_ = sgsrSharpness;
     fovScale_ = fovScale;
     fovBorder_ = fovBorder;
@@ -267,9 +308,28 @@ void XrImmersiveSession::runLoop() {
         XrFrameState frameState{XR_TYPE_FRAME_STATE};
         if (!XrCheck(xrWaitFrame(session_, &waitInfo, &frameState), "xrWaitFrame")) break;
 
+        {
+            std::lock_guard<std::mutex> lock(windowsSnapshotMutex_);
+            windowsFrameAdmissionOpen_ = false;
+        }
         XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
-        if (!XrCheck(xrBeginFrame(session_, &beginInfo), "xrBeginFrame")) break;
+        XrResult beginResult;
+        if (vulkan_) {
+            std::lock_guard<std::mutex> lock(vulkan_->queueMutex);
+            beginResult = xrBeginFrame(session_, &beginInfo);
+        } else beginResult = xrBeginFrame(session_, &beginInfo);
+        if (!XrCheck(beginResult, "xrBeginFrame")) break;
 
+        const int64_t performanceTime=performanceNow();
+        if(vrPerformance.visible && getDisplayRefreshRate_ &&
+           performanceTime-performanceRefreshQueryAt_>=5000000000LL) {
+            float hz=0;
+            performanceRefreshQueryAt_=performanceTime;
+            performanceRefreshKnown_=XR_SUCCEEDED(getDisplayRefreshRate_(session_,&hz)) && std::isfinite(hz) && hz>0;
+            if(performanceRefreshKnown_) vrPerformance.refresh=hz;
+        }
+        if(!performanceRefreshKnown_ && frameState.predictedDisplayPeriod>0)
+            vrPerformance.refresh=1e9f/frameState.predictedDisplayPeriod;
         applyPendingPassthroughState();
         syncControllerInputs(frameState.predictedDisplayTime);
 
@@ -286,13 +346,20 @@ void XrImmersiveSession::runLoop() {
         runtimeSnapshot.recenterSerial = recenterSerial_.load();
         XrViewLocateInfo viewLocateInfo{XR_TYPE_VIEW_LOCATE_INFO};
         viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-        viewLocateInfo.displayTime = frameState.predictedDisplayTime;
+        viewLocateInfo.displayTime = runtimeSnapshot.predictedDisplayTime;
         viewLocateInfo.space = windowsTrackingSpace_;
         XrViewState viewState{XR_TYPE_VIEW_STATE};
         uint32_t viewCount = 0;
         if (XR_SUCCEEDED(xrLocateViews(session_, &viewLocateInfo, &viewState, 2, &viewCount,
                                        runtimeSnapshot.views.data())) && viewCount == 2) {
             runtimeSnapshot.viewStateFlags = viewState.viewStateFlags;
+            if(pico4VisibilityFallback_ && visibilityMasks.updatePicoFallback(
+                    {runtimeSnapshot.views[0].fov,runtimeSnapshot.views[1].fov})) {
+                auto masks=visibilityMasks.visible();
+                windowsProjection_.setVisibilityMasks(masks);
+                LOGI("Visibility mask: Pico 4 Quest3-outline fallback active, no expansion, visible indices=%zu/%zu",
+                     masks[0].indices.size(),masks[1].indices.size());
+            }
         } else {
             runtimeSnapshot.viewStateFlags = 0;
         }
@@ -300,7 +367,7 @@ void XrImmersiveSession::runLoop() {
             std::lock_guard<std::mutex> lock(snapshotMutex_);
             runtimeSnapshot.input = snapshot_;
         }
-        syncWindowsTrackingPoses(&runtimeSnapshot.input, frameState.predictedDisplayTime);
+        syncWindowsTrackingPoses(&runtimeSnapshot.input, runtimeSnapshot.predictedDisplayTime);
         {
             std::lock_guard<std::mutex> lock(windowsSnapshotMutex_);
             windowsSnapshot_ = runtimeSnapshot;
@@ -314,7 +381,7 @@ void XrImmersiveSession::runLoop() {
         // Every xrBeginFrame must be matched by an xrEndFrame, but a layer may only reference a
         // swapchain image that was actually acquired — so a failed renderFrame() still ends the
         // frame, just with no layers.
-        if (frameState.shouldRender && submitWindowsProjection(frameState.predictedDisplayTime)) {
+        if (frameState.shouldRender && submitWindowsProjection(frameState.predictedDisplayTime, frameState.predictedDisplayPeriod)) {
         } else if (frameState.shouldRender && renderFrame()) {
             submitQuadLayer(frameState.predictedDisplayTime, localSpace_, swapchain_,
                              swapchainWidth_, swapchainHeight_, true);
@@ -324,8 +391,16 @@ void XrImmersiveSession::runLoop() {
             endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
             endInfo.layerCount = 0;
             endInfo.layers = nullptr;
-            xrEndFrame(session_, &endInfo);
+            endFrame(&endInfo);
         }
+        // Give ready XR presentation its submission opportunity before releasing
+        // the next game frame. This never waits for Android GPU completion, and
+        // xrWaitFrame/controller updates keep running independently of the guest.
+        {
+            std::lock_guard<std::mutex> lock(windowsSnapshotMutex_);
+            windowsFrameAdmissionOpen_ = true;
+        }
+        windowsSnapshotCondition_.notify_all();
     }
 
     teardown();
@@ -349,10 +424,16 @@ bool XrImmersiveSession::setupInstanceAndSession() {
         return false;
     }
 
+    if (!IsInstanceExtensionSupported(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) {
+        LOGE("OpenXR runtime lacks XR_KHR_vulkan_enable2 required by shared Vulkan presentation");
+        return false;
+    }
     std::vector<const char *> extensions = {
         XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
-        XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
+        XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
     };
+    const bool visibilityAvailable = IsInstanceExtensionSupported(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
+    if(visibilityAvailable) extensions.push_back(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
     const bool timeConversionAvailable = IsInstanceExtensionSupported(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
     if (timeConversionAvailable) extensions.push_back(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
     passthroughExtensionAvailable_ = IsInstanceExtensionSupported(XR_FB_PASSTHROUGH_EXTENSION_NAME);
@@ -380,6 +461,10 @@ bool XrImmersiveSession::setupInstanceAndSession() {
     const char *picoControllerExtension = "XR_BD_controller_interaction";
     const bool picoControllerExtensionAvailable = IsInstanceExtensionSupported(picoControllerExtension);
     if (picoControllerExtensionAvailable) extensions.push_back(picoControllerExtension);
+    const bool subsampledSwapchains =
+        IsInstanceExtensionSupported(XR_META_VULKAN_SWAPCHAIN_CREATE_INFO_EXTENSION_NAME);
+    if (subsampledSwapchains)
+        extensions.push_back(XR_META_VULKAN_SWAPCHAIN_CREATE_INFO_EXTENSION_NAME);
 
     XrInstanceCreateInfoAndroidKHR androidInfo{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
     androidInfo.applicationVM = vm_;
@@ -420,6 +505,10 @@ bool XrImmersiveSession::setupInstanceAndSession() {
     systemGetInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     if (!XrCheck(xrGetSystem(instance_, &systemGetInfo, &systemId_), "xrGetSystem")) return false;
 
+    char deviceName[PROP_VALUE_MAX]{};
+    __system_property_get("ro.product.device",deviceName);
+    pico4VisibilityFallback_=std::strcmp(deviceName,"PICOA8110")==0;
+
     // Passthrough needs ALPHA_BLEND — but requesting a blend mode xrEndFrame doesn't list as
     // supported for this view config is a validation error (this runtime rejected every frame
     // with xrEndFrame failing -1 once passthrough was toggled on, until this check was added).
@@ -438,58 +527,21 @@ bool XrImmersiveSession::setupInstanceAndSession() {
         LOGI("XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND not supported by this runtime — passthrough toggle will no-op");
     }
 
-    PFN_xrGetOpenGLESGraphicsRequirementsKHR getGraphicsRequirements = nullptr;
-    xrGetInstanceProcAddr(instance_, "xrGetOpenGLESGraphicsRequirementsKHR",
-                          reinterpret_cast<PFN_xrVoidFunction *>(&getGraphicsRequirements));
-    XrGraphicsRequirementsOpenGLESKHR graphicsRequirements{XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR};
-    if (getGraphicsRequirements != nullptr) {
-        getGraphicsRequirements(instance_, systemId_, &graphicsRequirements);
-    }
-
-    // --- EGL context, dedicated to this session (not yet shared with the app's own
-    // GLRenderer/DXVK-facing surface — see the header comment / plan follow-ups). ---
-    eglDisplay_ = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    EGLint eglMajor, eglMinor;
-    eglInitialize(eglDisplay_, &eglMajor, &eglMinor);
-    eglBindAPI(EGL_OPENGL_ES_API);
-
-    const EGLint configAttribs[] = {
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR,
-        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
-        EGL_NONE,
-    };
-    EGLint numConfigs = 0;
-    eglChooseConfig(eglDisplay_, configAttribs, &eglConfig_, 1, &numConfigs);
-    if (numConfigs == 0) {
-        LOGE("eglChooseConfig found no matching config");
+    vulkan_ = std::make_unique<XrVulkanContext>();
+    if (!vulkan_->initialize(instance_, systemId_, subsampledSwapchains)) {
+        LOGE("Shared system Vulkan OpenXR initialization failed");
         return false;
     }
-
-    const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
-    // SGSR uses core texture gathers. Request GLES 3.1, retaining the usual
-    // context fallback so unsupported devices can still use bilinear rendering.
-    if (upscaler_ == 2 || upscaler_ == 3) {
-        const EGLint sgsrAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3,
-                                     EGL_CONTEXT_MINOR_VERSION_KHR, 1, EGL_NONE};
-        eglContext_ = eglCreateContext(eglDisplay_, eglConfig_, EGL_NO_CONTEXT, sgsrAttribs);
-    }
-    if (eglContext_ == EGL_NO_CONTEXT)
-        eglContext_ = eglCreateContext(eglDisplay_, eglConfig_, EGL_NO_CONTEXT, contextAttribs);
-
-    const EGLint pbufferAttribs[] = {EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE};
-    eglPbufferSurface_ = eglCreatePbufferSurface(eglDisplay_, eglConfig_, pbufferAttribs);
-    eglMakeCurrent(eglDisplay_, eglPbufferSurface_, eglPbufferSurface_, eglContext_);
-
-    XrGraphicsBindingOpenGLESAndroidKHR graphicsBinding{XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR};
-    graphicsBinding.display = eglDisplay_;
-    graphicsBinding.config = eglConfig_;
-    graphicsBinding.context = eglContext_;
-
+    XrGraphicsBindingVulkan2KHR graphicsBinding{XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR};
+    graphicsBinding.instance = vulkan_->instance;
+    graphicsBinding.physicalDevice = vulkan_->physical;
+    graphicsBinding.device = vulkan_->device;
+    graphicsBinding.queueFamilyIndex = vulkan_->family;
+    graphicsBinding.queueIndex = 0;
+    XrSession createdSession = XR_NULL_HANDLE;
     XrSessionCreateInfo sessionCreateInfo{XR_TYPE_SESSION_CREATE_INFO};
     sessionCreateInfo.next = &graphicsBinding;
     sessionCreateInfo.systemId = systemId_;
-    XrSession createdSession = XR_NULL_HANDLE;
     if (!XrCheck(xrCreateSession(instance_, &sessionCreateInfo, &createdSession), "xrCreateSession")) {
         return false;
     }
@@ -534,6 +586,8 @@ bool XrImmersiveSession::setupInstanceAndSession() {
     }
 
     if (refreshRateExtensionAvailable_) {
+        xrGetInstanceProcAddr(instance_, "xrGetDisplayRefreshRateFB",
+                              reinterpret_cast<PFN_xrVoidFunction *>(&getDisplayRefreshRate_));
         PFN_xrEnumerateDisplayRefreshRatesFB enumerateRates = nullptr;
         PFN_xrRequestDisplayRefreshRateFB requestRate = nullptr;
         xrGetInstanceProcAddr(instance_, "xrEnumerateDisplayRefreshRatesFB",
@@ -599,7 +653,7 @@ bool XrImmersiveSession::setupInstanceAndSession() {
     // gamma (washed-out output).
     int64_t chosenFormat = formats.empty() ? 0x8C43 /* GL_SRGB8_ALPHA8 */ : formats[0];
     for (int64_t f : formats) {
-        if (f == 0x8C43) {
+        if (f == (vulkan_ ? int64_t(VK_FORMAT_R8G8B8A8_SRGB) : 0x8C43)) {
             chosenFormat = f;
             srgbSwapchain_ = true;
             break;
@@ -607,7 +661,7 @@ bool XrImmersiveSession::setupInstanceAndSession() {
     }
     if (!srgbSwapchain_) {
         for (int64_t f : formats) {
-            if (f == 0x8058 /* GL_RGBA8 */) {
+            if (f == (vulkan_ ? int64_t(VK_FORMAT_R8G8B8A8_UNORM) : 0x8058)) {
                 chosenFormat = f;
                 break;
             }
@@ -627,6 +681,11 @@ bool XrImmersiveSession::setupInstanceAndSession() {
         return false;
     }
 
+    performanceFormat_=VkFormat(chosenFormat);
+    if(vulkan_) {
+        vulkanQuad_=std::make_unique<XrVulkanPresenter>();
+        if(!vulkanQuad_->initialize(vulkan_.get(),swapchain_,VkFormat(chosenFormat),swapchainWidth_,swapchainHeight_,1,0,1,1,0)) return false;
+    } else {
     uint32_t imageCount = 0;
     xrEnumerateSwapchainImages(swapchain_, 0, &imageCount, nullptr);
     swapchainImages_.resize(imageCount);
@@ -637,6 +696,7 @@ bool XrImmersiveSession::setupInstanceAndSession() {
 
     glGenFramebuffers(1, &framebuffer_);
 
+    }
     uint32_t projectionViewCount = 0;
     xrEnumerateViewConfigurationViews(instance_, systemId_, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
                                       0, &projectionViewCount, nullptr);
@@ -651,7 +711,8 @@ bool XrImmersiveSession::setupInstanceAndSession() {
         const uint32_t recommendedWidth = projectionViews[0].recommendedImageRectWidth;
         const uint32_t recommendedHeight = projectionViews[0].recommendedImageRectHeight;
         GLint maxTextureSize = 0;
-        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+        if(vulkan_) maxTextureSize=vulkan_->properties.limits.maxImageDimension2D;
+        else glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
         const uint32_t maxWidth = std::min({projectionViews[0].maxImageRectWidth,
             projectionViews[1].maxImageRectWidth, static_cast<uint32_t>(maxTextureSize),
             physical ? static_cast<uint32_t>(physicalEyeWidth_) : recommendedWidth}) & ~1u;
@@ -689,10 +750,17 @@ bool XrImmersiveSession::setupInstanceAndSession() {
                  windowsSnapshot_.stageBounds.height,
                  static_cast<int>(boundsResult));
         }
+        if(visibilityAvailable) xrGetInstanceProcAddr(instance_, "xrGetVisibilityMaskKHR", reinterpret_cast<PFN_xrVoidFunction*>(&getVisibilityMask_));
+        visibilityMasks.refresh(session_,getVisibilityMask_);
+        windowsProjection_.setVisibilityMasks(visibilityMasks.visible());
+        LOGI("Visibility mask: supported=%d visible indices=%zu/%zu", getVisibilityMask_!=nullptr, visibilityMasks.visible()[0].indices.size(), visibilityMasks.visible()[1].indices.size());
         windowsProjectionReady_ = windowsProjection_.initialize(
             session_, chosenFormat,
-            eyeWidth, eyeHeight, eglDisplay_, upscaler_, sgsrSharpness_, fovScale_, fovBorder_);
+            eyeWidth, eyeHeight, eglDisplay_, upscaler_, sgsrSharpness_, fovScale_, fovBorder_, fxaa_, ffrDebug_, vulkan_.get());
     }
+        windowsTransport_.probeHardwareBuffer = [this](const windowsvr::EyeFrame &frame) {
+            return vulkan_ && windowsvr::VulkanEyeCapture::probe(vulkan_->device, vulkan_->ahbProperties, frame);
+        };
         windowsTransport_.start("@gamenative-xr");
 
     // --- Input: action set + Meta Quest Touch controller bindings. ---
@@ -836,8 +904,8 @@ bool XrImmersiveSession::setupInstanceAndSession() {
         setupPassthrough();
     }
 
-    LOGI("OpenXR immersive session initialized (%dx%d quad, %u swapchain images)",
-         swapchainWidth_, swapchainHeight_, imageCount);
+    LOGI("OpenXR immersive session initialized (%dx%d quad, %s)",
+         swapchainWidth_, swapchainHeight_, vulkan_ ? vulkan_->driverLabel() : "GLES");
     return true;
 }
 
@@ -867,7 +935,11 @@ void XrImmersiveSession::pollXrEvents() {
                 default:
                     break;
             }
+        } else if (event.type == XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR) {
+            visibilityMasks.refresh(session_,getVisibilityMask_);
+            windowsProjection_.setVisibilityMasks(visibilityMasks.visible());
         } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+            windowsProjection_.resetFrameGeneration();
             const auto *change = reinterpret_cast<const XrEventDataReferenceSpaceChangePending *>(&event);
             const bool tracked = change->referenceSpaceType == windowsTrackingSpaceType_ && change->poseValid;
             const uint32_t serial = tracked ? recenterSerial_.fetch_add(1) + 1 : recenterSerial_.load();
@@ -1073,7 +1145,94 @@ void XrImmersiveSession::uploadPendingGameFrameLocked() {
     hasPendingFrame_ = false;
 }
 
+void XrImmersiveSession::submitPerformanceBitmap(const uint8_t *pixels, int width, int height, int stride) {
+    if(!pixels || width!=1024 || height!=256 || stride<width*4) return;
+    std::lock_guard<std::mutex> lock(performanceBitmapMutex_);
+    performancePixels_.resize(width*height*4);
+    for(int y=0;y<height;++y) std::memcpy(performancePixels_.data()+y*width*4,pixels+y*stride,width*4);
+    // Android Canvas stores premultiplied RGBA. The quad shader consumes
+    // straight color, and the performance layer declares unpremultiplied alpha.
+    for(size_t i=0;i<performancePixels_.size();i+=4) {
+        const unsigned a=performancePixels_[i+3];
+        for(int c=0;c<3;++c) performancePixels_[i+c]=a ?
+            uint8_t(std::min(255u,(unsigned(performancePixels_[i+c])*255u+a/2)/a)) : 0;
+    }
+    ++performanceVersion_;
+}
+
+bool XrImmersiveSession::renderPerformanceOverlay(XrCompositionLayerQuad &layer) {
+    if(!vulkan_ || !vrPerformance.visible || performanceFailed_) return false;
+    std::vector<uint8_t> pixels;
+    uint64_t version;
+    {
+        // Do not hold the JNI producer's mutex across runtime/GPU calls.
+        std::lock_guard<std::mutex> lock(performanceBitmapMutex_);
+        if(performancePixels_.empty()) return false;
+        version=performanceVersion_;
+        if(version!=performanceRenderedVersion_) pixels=performancePixels_;
+    }
+    if(!performancePresenter_) {
+        XrReferenceSpaceCreateInfo space{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+        space.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_VIEW; space.poseInReferenceSpace=IdentityPose();
+        XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        info.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+        info.format=performanceFormat_; info.sampleCount=1;
+        info.width=1024; info.height=256; info.faceCount=info.arraySize=info.mipCount=1;
+        if(XR_FAILED(xrCreateReferenceSpace(session_,&space,&performanceViewSpace_)) ||
+           XR_FAILED(xrCreateSwapchain(session_,&info,&performanceSwapchain_))) {
+            performanceFailed_=true; LOGE("Performance overlay space/swapchain creation failed"); return false;
+        }
+        performancePresenter_=std::make_unique<XrVulkanPresenter>();
+        if(!performancePresenter_->initialize(vulkan_.get(),performanceSwapchain_,performanceFormat_,1024,256,1,0,1,1,0)) {
+            performanceFailed_=true; LOGE("Performance overlay renderer creation failed"); return false;
+        }
+    }
+    // The compositor reuses the released image until the one-second bitmap
+    // changes. No upload, draw, acquire or fence wait on intervening XR frames.
+    if(performanceRenderedVersion_!=version) {
+        if(!performancePresenter_->renderQuad(nullptr,pixels,1024,256,version,1,1)) return false;
+        performanceRenderedVersion_=version;
+    }
+    layer={XR_TYPE_COMPOSITION_LAYER_QUAD};
+    layer.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                     XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+    layer.space=performanceViewSpace_; layer.eyeVisibility=XR_EYE_VISIBILITY_BOTH;
+    layer.subImage.swapchain=performanceSwapchain_;
+    layer.subImage.imageRect={{0,0},{1024,256}};
+    layer.pose=IdentityPose();
+    layer.pose.position={0,-.30f,-.9f};
+    layer.pose.orientation={-.1305262f,0,0,.9914449f}; // 15 degrees forward.
+    layer.size={.75f,.1875f};
+    return true;
+}
+
+XrResult XrImmersiveSession::endFrame(const XrFrameEndInfo* info) {
+    if(!stereoActive_.load()) vrPerformance.used=0;
+    XrFrameEndInfo end=*info;
+    XrCompositionLayerQuad performance{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    // Existing paths submit at most passthrough + projection + quick menu.
+    std::array<const XrCompositionLayerBaseHeader*,4> layers{};
+    if(info->layerCount && info->layerCount<layers.size() && renderPerformanceOverlay(performance)) {
+        std::copy_n(info->layers,info->layerCount,layers.data());
+        layers[info->layerCount]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&performance);
+        end.layers=layers.data(); end.layerCount=info->layerCount+1;
+    }
+    XrResult result;
+    if(vulkan_) { std::lock_guard<std::mutex> lock(vulkan_->queueMutex); result=xrEndFrame(session_,&end); }
+    else result=xrEndFrame(session_,&end);
+    if(XR_SUCCEEDED(result) && info->layerCount) vrPerformance.present();
+    return result;
+}
+bool XrImmersiveSession::renderVulkanQuad() {
+    AHardwareBuffer* buffer=nullptr;
+    { std::lock_guard<std::mutex> lock(sharedBufferMutex_);buffer=pendingSharedBuffer_;if(buffer) AHardwareBuffer_acquire(buffer); }
+    std::lock_guard<std::mutex> lock(frameMutex_);
+    bool ok=vulkanQuad_ && vulkanQuad_->renderQuad(buffer,pendingFramePixels_,pendingFrameWidth_,pendingFrameHeight_,vulkanBitmapVersion_,quadContentScaleX_.load(),quadContentScaleY_.load());
+    if(buffer) AHardwareBuffer_release(buffer);
+    return ok;
+}
 bool XrImmersiveSession::renderFrame() {
+    if(vulkan_) return renderVulkanQuad();
     XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     uint32_t imageIndex = 0;
     if (!XrCheck(xrAcquireSwapchainImage(swapchain_, &acquireInfo, &imageIndex),
@@ -1157,21 +1316,23 @@ bool XrImmersiveSession::renderFrame() {
     return true;
 }
 
-bool XrImmersiveSession::submitWindowsProjection(XrTime predictedDisplayTime) {
+bool XrImmersiveSession::submitWindowsProjection(XrTime predictedDisplayTime, XrDuration displayPeriod) {
     if (!windowsProjectionReady_ || !windowsTransport_.hasStereoContent()) {
+        windowsProjection_.resetFrameGeneration();
         stereoActive_.store(false);
         stereoMisses_ = 0;
         return false;
     }
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-    if (!windowsProjection_.render(windowsTransport_, windowsTrackingSpace_, &projection, predictedDisplayTime)) {
+    if (!windowsProjection_.render(windowsTransport_, windowsTrackingSpace_, &projection, predictedDisplayTime, displayPeriod,
+            windowsClockReady_.load(std::memory_order_acquire) ? predictedDisplayTime - windowsClockOffset_ : 0)) {
         if (++stereoMisses_ >= 8) stereoActive_.store(false);
         return false;
     }
     stereoMisses_ = 0;
     stereoActive_.store(true);
     XrCompositionLayerQuad overlay{XR_TYPE_COMPOSITION_LAYER_QUAD};
-    const bool overlayRendered = windowsOverlayVisible_.load() && renderFrame();
+    const bool overlayRendered = !(kXrSwapchainPattern && vulkan_) && windowsOverlayVisible_.load() && renderFrame();
     if (overlayRendered) {
         overlay.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         overlay.space = localSpace_;
@@ -1209,7 +1370,7 @@ bool XrImmersiveSession::submitWindowsProjection(XrTime predictedDisplayTime) {
                                                        : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     endInfo.layerCount = layerCount;
     endInfo.layers = layers.data();
-    if (!XrCheck(xrEndFrame(session_, &endInfo), "xrEndFrame(windows projection)")) {
+    if (!XrCheck(endFrame(&endInfo), "xrEndFrame(windows projection)")) {
         stereoActive_.store(false);
     }
     return true;
@@ -1300,7 +1461,7 @@ void XrImmersiveSession::submitQuadLayer(XrTime predictedDisplayTime, XrSpace sp
                                                         : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     endInfo.layerCount = static_cast<uint32_t>(layers.size());
     endInfo.layers = layers.data();
-    XrCheck(xrEndFrame(session_, &endInfo), "xrEndFrame");
+    XrCheck(endFrame(&endInfo), "xrEndFrame");
 }
 
 void XrImmersiveSession::setQuadTransform(float x, float y, float z, float width, float height,
@@ -1400,6 +1561,7 @@ void XrImmersiveSession::applyPendingPassthroughState() {
 }
 
 void XrImmersiveSession::syncControllerInputs(XrTime predictedDisplayTime) {
+    std::lock_guard<std::mutex> locateLock(windowsLocateMutex_);
     XrActiveActionSet activeActionSet{actionSet_, XR_NULL_PATH};
     XrActionsSyncInfo syncInfo{XR_TYPE_ACTIONS_SYNC_INFO};
     syncInfo.countActiveActionSets = 1;
@@ -1483,8 +1645,11 @@ void XrImmersiveSession::syncControllerInputs(XrTime predictedDisplayTime) {
 
     const bool l3Pressed = getBool(thumbstickLClickAction_);
     const bool r3Pressed = getBool(thumbstickRClickAction_);
-    if (l3Pressed) next.buttons |= (1u << BUTTON_L3);
-    if (r3Pressed) next.buttons |= (1u << BUTTON_R3);
+    if(performanceChord_.update(l3Pressed,r3Pressed,performanceNow()))
+        vrPerformance.setVisible(!vrPerformance.visible.load());
+    const bool performanceChord=performanceChord_.consumed();
+    if (l3Pressed && !performanceChord) next.buttons |= (1u << BUTTON_L3);
+    if (r3Pressed && !performanceChord) next.buttons |= (1u << BUTTON_R3);
 
     next.triggerL = getFloat(triggerLAction_);
     next.triggerR = getFloat(triggerRAction_);
@@ -1526,7 +1691,8 @@ void XrImmersiveSession::syncControllerInputs(XrTime predictedDisplayTime) {
     };
     const bool leftDoubleClick = detectDoubleClick(l3Pressed, lastL3Pressed_, lastL3ClickTime_, l3ClickCount_);
     const bool rightDoubleClick = detectDoubleClick(r3Pressed, lastR3Pressed_, lastR3ClickTime_, r3ClickCount_);
-    next.pointerModeToggled = leftDoubleClick || rightDoubleClick;
+    next.pointerModeToggled = !performanceChord && (leftDoubleClick || rightDoubleClick);
+    if(performanceChord) { l3ClickCount_=r3ClickCount_=0; }
 
     // Aim-pose ray for each hand, in the same LOCAL space the quad transform lives in — lets
     // Kotlin do a simple ray/plane intersection against the quad's known rectangle instead of
@@ -1643,8 +1809,13 @@ void XrImmersiveSession::teardown() {
     windowsClockReady_.store(false, std::memory_order_release);
     stereoActive_.store(false);
     stereoMisses_ = 0;
-    windowsTransport_.stop();
+    vrPerformance.visible=false;
     windowsProjection_.shutdown();
+    if(performancePresenter_) { performancePresenter_->shutdown(); performancePresenter_.reset(); }
+    if(performanceSwapchain_!=XR_NULL_HANDLE) { xrDestroySwapchain(performanceSwapchain_); performanceSwapchain_=XR_NULL_HANDLE; }
+    if(performanceViewSpace_!=XR_NULL_HANDLE) { xrDestroySpace(performanceViewSpace_); performanceViewSpace_=XR_NULL_HANDLE; }
+    if(vulkanQuad_) {vulkanQuad_->shutdown();vulkanQuad_.reset();}
+    windowsTransport_.stop();
     teardownPassthrough();
     if (gameTexture_ != 0) {
         glDeleteTextures(1, &gameTexture_);
@@ -1726,6 +1897,7 @@ void XrImmersiveSession::teardown() {
             session_ = XR_NULL_HANDLE;
         }
     }
+    if(vulkan_) {vulkan_->shutdown();vulkan_.reset();}
     if (instance_ != XR_NULL_HANDLE) {
         xrDestroyInstance(instance_);
         instance_ = XR_NULL_HANDLE;

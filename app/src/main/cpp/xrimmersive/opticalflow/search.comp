@@ -1,0 +1,11 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#ifdef NATIVE_SUBGROUP
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+#define SEARCH_PASS 1
+#include "ffx_adapter.glsl"
+#include "upstream/ffx_opticalflow_compute_optical_flow_v5.h"
+layout(local_size_x=64) in;
+void main() { ComputeOpticalFlowAdvanced(ivec2(gl_GlobalInvocationID.xy),ivec2(gl_LocalInvocationID.xy),ivec2(gl_WorkGroupID.xy),int(gl_LocalInvocationIndex)); }

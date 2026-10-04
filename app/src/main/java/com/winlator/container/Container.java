@@ -95,6 +95,9 @@ public class Container {
     private int xrFovBorder = 0; // Black, Extend, Blurred
     // Stable saved IDs: 0 = bilinear, 1 = retired FSR, 2 = SGSR, 3 = SGSR edge direction.
     private int xrUpscaler = 2; // SGSR 1
+    private int xrFfrDebug = 0;
+    private boolean xrFxaa = true;
+    private boolean xrPackedTransport = true;
     private int xrSgsrSharpness = 70; // hundredths: 50 = 0.5 blend, 100 = 1.0, 200 = 2.0
     private boolean xrForceDisableMsaa = true;
     private int xrFoveation = 1; // Off, Conservative (default), Aggressive
@@ -315,6 +318,15 @@ public class Container {
     public int getXrFoveation() { return xrFoveation; }
 
     public void setXrFoveation(int value) { xrFoveation = value >= 0 && value <= 2 ? value : 0; }
+
+    public int getXrFfrDebug() { return xrFfrDebug; }
+    public void setXrFfrDebug(int value) { xrFfrDebug = value >= 0 && value <= 3 ? value : 0; }
+
+    public boolean getXrPackedTransport() { return xrPackedTransport; }
+    public void setXrPackedTransport(boolean value) { xrPackedTransport = value; }
+
+    public boolean getXrFxaa() { return xrFxaa; }
+    public void setXrFxaa(boolean value) { xrFxaa = value; }
 
     public int getXrSgsrSharpness() { return xrSgsrSharpness; }
 
@@ -816,6 +828,9 @@ public class Container {
             data.put("xrFovBorder", xrFovBorder);
             data.put("xrUpscaler", xrUpscaler);
             data.put("xrSgsrSharpness", xrSgsrSharpness);
+            data.put("xrFfrDebug", xrFfrDebug);
+            data.put("xrFxaa", xrFxaa);
+            data.put("xrPackedTransport", xrPackedTransport);
             data.put("xrForceDisableMsaa", xrForceDisableMsaa);
             data.put("xrFoveation", xrFoveation);
             data.put("sfCompatMode", sfCompatMode);
@@ -965,6 +980,15 @@ public class Container {
                     break;
                 case "xrFoveation" :
                     setXrFoveation(data.getInt(key));
+                    break;
+                case "xrFfrDebug" :
+                    setXrFfrDebug(data.getInt(key));
+                    break;
+                case "xrPackedTransport" :
+                    setXrPackedTransport(data.getBoolean(key));
+                    break;
+                case "xrFxaa" :
+                    setXrFxaa(data.getBoolean(key));
                     break;
                 case "xrSgsrSharpness" :
                     setXrSgsrSharpness(data.getInt(key));

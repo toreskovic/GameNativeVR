@@ -28,7 +28,7 @@ class WindowsVrSnapshotProvider {
         }
     }
 
-    fun waitFrame(afterSerial: Long, timeoutMs: Int): WindowsVrRuntimeSnapshot? {
+    fun waitFrame(afterSerial: Long, timeoutMs: Int, productionBudgetNs: Long = -1): WindowsVrRuntimeSnapshot? {
         val activeHandle = handle
         if (activeHandle == 0L) return null
         val snapshot = WindowsVrRuntimeSnapshot(LongArray(12), FloatArray(22), FloatArray(36), IntArray(3))
@@ -36,6 +36,7 @@ class WindowsVrSnapshotProvider {
                 activeHandle,
                 afterSerial,
                 timeoutMs,
+                productionBudgetNs,
                 snapshot.timing,
                 snapshot.views,
                 snapshot.input,
@@ -49,6 +50,13 @@ class WindowsVrSnapshotProvider {
         return snapshot
     }
 
+    fun visibilityRevision(): Int = synchronized(lock) {
+        if(handle == 0L) 0 else XrNative.nativeVisibilityRevision(handle)
+    }
+    fun visibilityMask(eye: Int, type: Int, offset: Int): String = synchronized(lock) {
+        if(handle == 0L) "ERROR unavailable" else XrNative.nativeVisibilityMask(handle, eye, type, offset)
+    }
+
     fun currentXrTime(): Long = synchronized(lock) {
         if (handle == 0L) 0L else XrNative.nativeGetWindowsXrTime(handle)
     }
@@ -60,6 +68,14 @@ class WindowsVrSnapshotProvider {
         val flags = current.flags.copyOf()
         if (!XrNative.nativeLocateWindowsViews(handle, time, views, flags)) return null
         current.copy(views = views, flags = flags)
+    }
+
+    fun locateHand(time: Long, hand: Int, aim: Boolean): Pair<FloatArray, IntArray>? = synchronized(lock) {
+        if (handle == 0L || time <= 0L || hand !in 0..1) return null
+        val pose = FloatArray(13)
+        val flags = IntArray(2)
+        if (!XrNative.nativeLocateWindowsHand(handle, time, hand, aim, pose, flags)) return null
+        pose to flags
     }
 
     fun latest(): WindowsVrRuntimeSnapshot? = latest

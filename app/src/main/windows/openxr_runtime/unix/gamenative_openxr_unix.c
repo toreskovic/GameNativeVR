@@ -1,9 +1,12 @@
 #define _GNU_SOURCE
 #include "../gamenative_openxr_unix.h"
+#include "gamenative_frame_pacing.h"
+#include "../gamenative_foveated_packing.h"
 
 #if defined(__ANDROID__)
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #include <android/hardware_buffer.h>
+#include <android/log.h>
 #endif
 #include <vulkan/vulkan.h>
 
@@ -13,6 +16,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +27,10 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__ANDROID__)
+#include "foveated_pack.h"
+#endif
 
 #define GN_FOURCC(a, b, c, d) \
     ((uint32_t)(a) | ((uint32_t)(b) << 8) | \
@@ -40,6 +48,11 @@ enum gn_transport_kind {
 };
 
 struct gn_transport_image {
+#if defined(__ANDROID__)
+    struct gn_pack pack;
+#endif
+    uint32_t packed_width, packed_height;
+    uint8_t packed;
     VkImage image;
     VkDeviceMemory memory;
     VkCommandBuffer command_buffer;
@@ -48,6 +61,8 @@ struct gn_transport_image {
     uint8_t registered;
     uint8_t initialized;
     uint8_t steady_recorded;
+    uint8_t external;
+    uint32_t recorded_array_index;
 };
 
 struct wine_client_object {
@@ -70,6 +85,7 @@ struct gn_image {
     VkImage relay_source_image;
     VkDeviceMemory relay_source_memory;
     uint8_t submitted;
+    int pending_release_fd[2];
 };
 
 struct gn_swapchain {
@@ -100,6 +116,8 @@ static void *vulkan_so;
 static int transport_fd = -1;
 static uint8_t transport_frame_announced[2];
 static uint64_t transport_frame_id;
+static atomic_uchar transport_ownership_failed;
+static atomic_uint outputs_handed_off;
 
 static PFN_vkGetDeviceProcAddr p_vkGetDeviceProcAddr;
 static PFN_vkGetPhysicalDeviceMemoryProperties p_vkGetPhysicalDeviceMemoryProperties;
@@ -374,6 +392,10 @@ static int recv_fd(int socket_fd)
 
 static void close_transport(void)
 {
+    /* A disconnected consumer may still be reading a shared source. Do not
+     * treat a fresh socket with no leases as proof that those reads retired. */
+    if (atomic_load(&outputs_handed_off) && !atomic_exchange(&transport_ownership_failed, 1))
+        log_line("Eye output transport disconnected with outstanding ownership; game restart required");
     if (transport_fd >= 0) close(transport_fd);
     transport_fd = -1;
 }
@@ -427,6 +449,38 @@ static int transact_line(const char *line, char *response, size_t response_size)
     return 1;
 }
 
+#if defined(__ANDROID__)
+typedef VkResult (*gn_allocate_shared_fn)(VkDevice, const VkImageCreateInfo *, VkImage,
+                                         VkDeviceMemory *, AHardwareBuffer **);
+static gn_allocate_shared_fn allocate_shared;
+typedef VkResult (*gn_create_completion_fn)(VkDevice, VkSemaphore *);
+typedef VkResult (*gn_export_completion_fn)(VkDevice, VkSemaphore, int *);
+typedef void (*gn_destroy_completion_fn)(VkDevice, VkSemaphore);
+static gn_create_completion_fn create_completion;
+static gn_export_completion_fn export_completion;
+static gn_destroy_completion_fn destroy_completion;
+static int shared_provider_checked;
+static void load_shared_provider(void)
+{
+    if (shared_provider_checked) return;
+    shared_provider_checked = 1;
+    /* Resolve only the already-loaded wrapper; never create a second driver. */
+    void *wrapper = dlopen("libvulkan_wrapper.so", RTLD_NOW | RTLD_NOLOAD);
+    if (wrapper) allocate_shared = (gn_allocate_shared_fn)dlsym(wrapper, "gamenative_xr_allocate_shared_image_v1");
+    if (wrapper) {
+        create_completion = (gn_create_completion_fn)dlsym(wrapper, "gamenative_xr_create_completion_semaphore_v1");
+        export_completion = (gn_export_completion_fn)dlsym(wrapper, "gamenative_xr_export_completion_semaphore_v1");
+        destroy_completion = (gn_destroy_completion_fn)dlsym(wrapper, "gamenative_xr_destroy_completion_semaphore_v1");
+    }
+    if (!create_completion || !export_completion || !destroy_completion)
+        create_completion = NULL;
+    if (wrapper && !allocate_shared && !create_completion) dlclose(wrapper);
+    log_line(allocate_shared ? "Same-device eye AHB allocator available" : "Same-device eye AHB allocator unavailable; keeping legacy allocation fallback");
+}
+static int create_ahardwarebuffer_transport(const struct gn_swapchain *, struct gn_transport_image *);
+#endif
+static void destroy_transport_image(struct gn_transport_image *);
+
 static void load_vulkan_functions(void)
 {
     if (!vulkan_so) vulkan_so = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
@@ -476,6 +530,7 @@ static void load_vulkan_functions(void)
     LOAD_HOST_TRAMPOLINE(vkGetFenceFdKHR);
 #if defined(__ANDROID__)
     LOAD_HOST_TRAMPOLINE(vkGetAndroidHardwareBufferPropertiesANDROID);
+    load_shared_provider();
 #endif
 #undef LOAD_HOST_TRAMPOLINE
 }
@@ -528,11 +583,11 @@ static int ahb_transport_probe(void)
                  AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT
     };
     AHardwareBuffer *buffer = NULL;
-    if (p_vkGetAndroidHardwareBufferPropertiesANDROID && command_pool &&
+    if ((p_vkGetAndroidHardwareBufferPropertiesANDROID || allocate_shared) && command_pool &&
         p_vkCmdCopyImage && gn_ahb_allocate(&descriptor, &buffer) == 0 && buffer) {
         gn_ahb_release(buffer);
         cached = 1;
-        log_line("AHardwareBuffer transport available; using optimal-tiling render targets");
+        log_line("AHardwareBuffer transport available; probing optimal-tiling render targets");
     } else {
         cached = -1;
         log_line("AHardwareBuffer transport unavailable; render targets stay linear/exportable");
@@ -541,11 +596,54 @@ static int ahb_transport_probe(void)
 }
 #endif
 
+#if defined(__ANDROID__)
+
+
+static int probe_transport_buffer(AHardwareBuffer *buffer, uint32_t width, uint32_t height,
+                               uint32_t layers, int packed)
+{
+    char line[160], reply[64];
+    /* Registration is not committed here; rejection keeps the relay available
+     * before exposing any image to the game. */
+    snprintf(line, sizeof(line), "PROBE_BUFFER eye=0 index=0 w=%u h=%u layer=%u packing=%u\n",
+             width, height, layers - 1, packed ? 1u : 0u);
+    pthread_mutex_lock(&socket_mutex);
+    int ok = transact_line(line, reply, sizeof(reply));
+    if (ok && !strncmp(reply, "OK", 2)) {
+        ok = gn_ahb_send(buffer, transport_fd) == 0 &&
+             read_line(transport_fd, reply, sizeof(reply));
+        if (!ok) close_transport();
+        ok = ok && !strncmp(reply, "OK", 2);
+    } else ok = 0;
+    pthread_mutex_unlock(&socket_mutex);
+    return ok;
+}
+
+
+#endif
+
 static int create_image(struct gn_swapchain *swapchain, struct gn_image *out,
                         uint32_t array_size, uint32_t mip_count, uint32_t sample_count,
-                        int optimal)
+                        int prepare_ahb_copy)
 {
-    if (optimal) {
+    out->pending_release_fd[0] = out->pending_release_fd[1] = -1;
+#if defined(__ANDROID__)
+    if (prepare_ahb_copy) {
+        int ready = 1;
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            if (!create_ahardwarebuffer_transport(swapchain, &out->transport[eye]) ||
+                !probe_transport_buffer(out->transport[eye].hardware_buffer, swapchain->width, swapchain->height, 1, out->transport[eye].packed)) {
+                ready = 0;
+                break;
+            }
+        }
+        prepare_ahb_copy = ready;
+        if (!ready) for (unsigned eye = 0; eye < 2; ++eye) destroy_transport_image(&out->transport[eye]);
+    }
+#endif
+    /* Private source images retain the driver's optimal layout; only the
+     * separate per-eye copy outputs cross the Android boundary. */
+    if (prepare_ahb_copy) {
         VkImageCreateInfo optimal_info = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .imageType = VK_IMAGE_TYPE_2D,
@@ -600,13 +698,14 @@ static int create_image(struct gn_swapchain *swapchain, struct gn_image *out,
         out->dma_buf_fd = -1;
         out->plane_count = 0;
         out->modifier = 0;
+        log_line("Eye copy source: optimal tiling, device-local allocation");
         return 1;
     optimal_fail:
-        if (out->memory && p_vkFreeMemory) p_vkFreeMemory(device, out->memory, NULL);
-        out->memory = VK_NULL_HANDLE;
+        for (unsigned eye = 0; eye < 2; ++eye) destroy_transport_image(&out->transport[eye]);
         if (out->image && p_vkDestroyImage) p_vkDestroyImage(device, out->image, NULL);
         out->image = VK_NULL_HANDLE;
-        return 0;
+        if (out->memory && p_vkFreeMemory) p_vkFreeMemory(device, out->memory, NULL);
+        out->memory = VK_NULL_HANDLE;
     }
 
     VkExternalMemoryImageCreateInfo external = {
@@ -1467,6 +1566,7 @@ static int relay_register(uint32_t slot, uint32_t image_index, uint32_t eye)
 
 static void destroy_transport_image(struct gn_transport_image *transport)
 {
+    if (transport->external) atomic_fetch_sub(&outputs_handed_off, 1);
 #if defined(__ANDROID__)
     if (transport->relay) {
         if (transport->command_buffer && relay_pool)
@@ -1479,6 +1579,9 @@ static void destroy_transport_image(struct gn_transport_image *transport)
         return;
     }
 #endif
+    #if defined(__ANDROID__)
+    gn_pack_destroy(&transport->pack);
+    #endif
     if (transport->command_buffer && command_pool && p_vkFreeCommandBuffers)
         p_vkFreeCommandBuffers(device, command_pool, 1, &transport->command_buffer);
     if (transport->image && p_vkDestroyImage)
@@ -1493,14 +1596,61 @@ static void destroy_transport_image(struct gn_transport_image *transport)
 }
 
 #if defined(__ANDROID__)
-static int create_ahardwarebuffer_transport(
-    const struct gn_swapchain *swapchain, struct gn_transport_image *transport)
+static int create_ahardwarebuffer_transport_impl(
+    const struct gn_swapchain *swapchain, struct gn_transport_image *transport, int allow_packing)
 {
-    if (!p_vkGetAndroidHardwareBufferPropertiesANDROID || !command_pool ||
+    if ((!p_vkGetAndroidHardwareBufferPropertiesANDROID && !allocate_shared) || !command_pool ||
         !p_vkAllocateCommandBuffers || !p_vkResetCommandBuffer ||
         !p_vkBeginCommandBuffer || !p_vkEndCommandBuffer ||
         !p_vkCmdPipelineBarrier || !p_vkCmdCopyImage || !p_vkQueueSubmit)
         return 0;
+
+    /* Fixed, separable packing v1. Keep legacy/native-allocation fallbacks ordinary. */
+    transport->packed = allow_packing && allocate_shared && swapchain->sample_count == 1 &&
+                        swapchain->width >= 16 && swapchain->height >= 16;
+    transport->packed_width = transport->packed ? gn_packed_extent(swapchain->width) : swapchain->width;
+    transport->packed_height = transport->packed ? gn_packed_extent(swapchain->height) : swapchain->height;
+    VkResult result;
+    if (allocate_shared) {
+        const int srgb_output = transport->packed &&
+            (swapchain->format == VK_FORMAT_R8G8B8A8_SRGB ||
+             swapchain->format == VK_FORMAT_B8G8R8A8_SRGB);
+        /* An unrestricted mutable image can force linear/uncompressed storage
+         * on Adreno. Only these two compatible views are ever used. */
+        const VkFormat view_formats[] = {
+            VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB
+        };
+        VkImageFormatListCreateInfo format_list = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+            .viewFormatCount = 2, .pViewFormats = view_formats,
+        };
+        VkExternalMemoryImageCreateInfo external = {
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .pNext = srgb_output ? &format_list : NULL,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+        };
+        VkImageCreateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &external,
+            .flags = srgb_output ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0,
+            .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+            .extent = {transport->packed_width, transport->packed_height, 1},
+            .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        result = p_vkCreateImage(device, &info, NULL, &transport->image);
+        if (result != VK_SUCCESS) goto fail;
+        /* The wrapper forwards the list during CreateImage and enables
+         * KHR_image_format_list. Its allocation ABI v1 accepts no pNext chain:
+         * it makes a conservative capability query, then allocates against
+         * this already-created dedicated image, retaining its view list/layout. */
+        info.pNext = NULL;
+        result = allocate_shared(device, &info, transport->image, &transport->memory,
+                                 (AHardwareBuffer **)&transport->hardware_buffer);
+        if (result != VK_SUCCESS) { log_vk_result("Same-device eye AHB allocation", result); goto fail; }
+        goto allocate_commands;
+    }
 
     AHardwareBuffer_Desc descriptor = {
         .width = swapchain->width,
@@ -1524,7 +1674,7 @@ static int create_ahardwarebuffer_transport(
         .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID,
         .pNext = &format_properties
     };
-    VkResult result = p_vkGetAndroidHardwareBufferPropertiesANDROID(
+    result = p_vkGetAndroidHardwareBufferPropertiesANDROID(
         device, buffer, &properties);
     if (result != VK_SUCCESS) {
         log_vk_result("vkGetAndroidHardwareBufferPropertiesANDROID", result);
@@ -1564,10 +1714,8 @@ static int create_ahardwarebuffer_transport(
         goto fail;
     }
 
-    VkMemoryRequirements requirements;
-    p_vkGetImageMemoryRequirements(device, transport->image, &requirements);
-    const uint32_t compatible_types =
-        requirements.memoryTypeBits & properties.memoryTypeBits;
+    /* Unbound AHB images must not be queried for memory requirements. */
+    const uint32_t compatible_types = properties.memoryTypeBits;
     int memory_type = find_memory_type(compatible_types, 0);
     if (memory_type < 0) {
         log_line("No compatible memory type for AHardwareBuffer image");
@@ -1601,6 +1749,9 @@ static int create_ahardwarebuffer_transport(
         goto fail;
     }
 
+allocate_commands:;
+    if (transport->packed && !gn_pack_init(&transport->pack, device, p_vkGetDeviceProcAddr,
+            transport->image, transport->packed_width, transport->packed_height, swapchain->format, swapchain->width, swapchain->height)) goto fail;
     VkCommandBufferAllocateInfo command_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = command_pool,
@@ -1613,12 +1764,28 @@ static int create_ahardwarebuffer_transport(
         log_vk_result("vkAllocateCommandBuffers(AHardwareBuffer)", result);
         goto fail;
     }
-    log_line("AHardwareBuffer Vulkan transport image created");
+    char packing_log[192];
+    snprintf(packing_log, sizeof(packing_log), "Same-device eye transport: packing=%u logical=%ux%u stored=%ux%u",
+             transport->packed, swapchain->width, swapchain->height, transport->packed_width, transport->packed_height);
+    log_line(packing_log);
     return 1;
 
 fail:
     destroy_transport_image(transport);
     return 0;
+}
+
+static int create_ahardwarebuffer_transport(
+    const struct gn_swapchain *swapchain, struct gn_transport_image *transport)
+{
+    const char *packing = getenv("GAMENATIVE_XR_PACKED_TRANSPORT");
+    if (!packing || strcmp(packing, "1") != 0)
+        return create_ahardwarebuffer_transport_impl(swapchain, transport, 0);
+    if (create_ahardwarebuffer_transport_impl(swapchain, transport, 1)) return 1;
+    /* A driver that rejects mutable sRGB output or the packing pipeline retains
+     * the ordinary same-device copy. The failed attempt has freed all resources. */
+    log_line("Packed eye allocation unavailable; retrying ordinary same-device copy");
+    return create_ahardwarebuffer_transport_impl(swapchain, transport, 0);
 }
 
 static int record_ahardwarebuffer_copy(
@@ -1627,8 +1794,9 @@ static int record_ahardwarebuffer_copy(
 {
 
 
-    if (transport->initialized && transport->steady_recorded) return 1;
+    if (transport->initialized && transport->steady_recorded && transport->recorded_array_index == array_index) return 1;
 
+    if (transport->packed && !gn_pack_source(&transport->pack, source->image, swapchain->format, array_index)) return 0;
     VkResult result = p_vkResetCommandBuffer(transport->command_buffer, 0);
     if (result != VK_SUCCESS) {
         log_vk_result("vkResetCommandBuffer(AHardwareBuffer)", result);
@@ -1636,7 +1804,7 @@ static int record_ahardwarebuffer_copy(
     }
     VkCommandBufferBeginInfo begin = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+        .flags = 0
     };
     result = p_vkBeginCommandBuffer(transport->command_buffer, &begin);
     if (result != VK_SUCCESS) {
@@ -1647,11 +1815,11 @@ static int record_ahardwarebuffer_copy(
     VkImageMemoryBarrier before[2] = {
         {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                             VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            /* Engines may blit/copy their final eye image rather than draw it. */
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = (transport->packed ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT),
             .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout = (transport->packed ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = source->image,
@@ -1661,13 +1829,13 @@ static int record_ahardwarebuffer_copy(
         },
         {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = transport->initialized ? VK_ACCESS_MEMORY_READ_BIT : 0,
-            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .srcAccessMask = 0,
+            .dstAccessMask = (transport->packed ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT),
             .oldLayout = transport->initialized ?
                 VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = (transport->packed ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
             .srcQueueFamilyIndex = transport->initialized ?
-                VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED,
+                VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = transport->initialized ?
                 queue_family_index : VK_QUEUE_FAMILY_IGNORED,
             .image = transport->image,
@@ -1678,7 +1846,7 @@ static int record_ahardwarebuffer_copy(
     };
     p_vkCmdPipelineBarrier(
         transport->command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, before);
+        (transport->packed ? (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT) : VK_PIPELINE_STAGE_TRANSFER_BIT), 0, 0, NULL, 0, NULL, 2, before);
 
     VkImageCopy copy = {
         .srcSubresource = {
@@ -1689,18 +1857,19 @@ static int record_ahardwarebuffer_copy(
         },
         .extent = {swapchain->width, swapchain->height, 1}
     };
-    p_vkCmdCopyImage(
+    if (transport->packed) gn_pack_record(&transport->pack, transport->command_buffer, swapchain->format);
+    else p_vkCmdCopyImage(
         transport->command_buffer, source->image,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, transport->image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        (transport->packed ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL), transport->image,
+        (transport->packed ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), 1, &copy);
 
     VkImageMemoryBarrier after[2] = {
         {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .srcAccessMask = (transport->packed ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT),
             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT |
                              VK_ACCESS_MEMORY_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .oldLayout = (transport->packed ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -1711,12 +1880,12 @@ static int record_ahardwarebuffer_copy(
         },
         {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcAccessMask = (transport->packed ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT),
+            .dstAccessMask = 0,
+            .oldLayout = (transport->packed ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .srcQueueFamilyIndex = queue_family_index,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
             .image = transport->image,
             .subresourceRange = {
                 VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1
@@ -1724,14 +1893,15 @@ static int record_ahardwarebuffer_copy(
         }
     };
     p_vkCmdPipelineBarrier(
-        transport->command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        transport->command_buffer, (transport->packed ? (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT) : VK_PIPELINE_STAGE_TRANSFER_BIT),
         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 2, after);
     result = p_vkEndCommandBuffer(transport->command_buffer);
     if (result != VK_SUCCESS) {
         log_vk_result("vkEndCommandBuffer(AHardwareBuffer)", result);
         return 0;
     }
-    if (transport->initialized) transport->steady_recorded = 1;
+    transport->recorded_array_index = array_index;
+    transport->steady_recorded = transport->initialized;
     return 1;
 }
 #endif
@@ -1739,6 +1909,8 @@ static int record_ahardwarebuffer_copy(
 
 static void destroy_image(struct gn_image *image)
 {
+    for (unsigned eye = 0; eye < 2; ++eye)
+        if (image->pending_release_fd[eye] >= 0) close(image->pending_release_fd[eye]);
     for (uint32_t eye = 0; eye < 2; ++eye)
         destroy_transport_image(&image->transport[eye]);
 #if defined(__ANDROID__)
@@ -1752,6 +1924,7 @@ static void destroy_image(struct gn_image *image)
     if (image->memory && p_vkFreeMemory) p_vkFreeMemory(device, image->memory, NULL);
     memset(image, 0, sizeof(*image));
     image->dma_buf_fd = -1;
+    image->pending_release_fd[0] = image->pending_release_fd[1] = -1;
 }
 
 static int register_ahardwarebuffer(
@@ -1767,14 +1940,14 @@ static int register_ahardwarebuffer(
     if (transport->registered) return 1;
 
     const uint32_t transport_index = slot * GN_UNIX_MAX_IMAGES + image_index;
-    const int swap_red_blue =
+    const int swap_red_blue = !transport->packed && (
         swapchain->format == VK_FORMAT_B8G8R8A8_UNORM ||
-        swapchain->format == VK_FORMAT_B8G8R8A8_SRGB;
+        swapchain->format == VK_FORMAT_B8G8R8A8_SRGB);
     char line[192], response[64] = {0};
     snprintf(line, sizeof(line),
-             "BUFFER eye=%u index=%u w=%u h=%u swizzle=%u\n",
+             "BUFFER eye=%u index=%u w=%u h=%u swizzle=%u packing=%u\n",
              eye, transport_index, swapchain->width, swapchain->height,
-             swap_red_blue ? 1u : 0u);
+             swap_red_blue ? 1u : 0u, transport->packed ? 1u : 0u);
     if (!transact_line(line, response, sizeof(response)) ||
         strncmp(response, "OK", 2) ||
         gn_ahb_send(
@@ -1813,6 +1986,7 @@ static int register_image(uint32_t slot, uint32_t image_index, uint32_t eye,
     if (array_index >= swapchain->array_size) return 0;
     if ((image->registered_eye_mask & bit) &&
         image->registered_array_index[eye] == array_index) return 1;
+
 
     if (image->transport_kind[eye] == GN_TRANSPORT_UNKNOWN) {
         if (register_ahardwarebuffer(slot, image_index, eye)) {
@@ -1924,70 +2098,6 @@ static int register_image(uint32_t slot, uint32_t image_index, uint32_t eye,
     return 1;
 }
 
-static int submit_and_make_acquire_fence_fd(
-    const VkCommandBuffer *commands, uint32_t command_count, int *submit_ok)
-{
-    *submit_ok = 0;
-    if (!p_vkQueueSubmit) return -1;
-    VkSubmitInfo submit = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = command_count,
-        .pCommandBuffers = command_count ? commands : NULL
-    };
-    const int can_export = p_vkCreateFence && p_vkDestroyFence &&
-        p_vkGetFenceFdKHR;
-    VkFence fence = VK_NULL_HANDLE;
-    if (!can_export) {
-        VkResult result = p_vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
-        if (result != VK_SUCCESS) {
-            log_vk_result("vkQueueSubmit(stereo transport)", result);
-            return -1;
-        }
-        if (!p_vkQueueWaitIdle || p_vkQueueWaitIdle(queue) != VK_SUCCESS)
-            return -1;
-        *submit_ok = 1;
-        return -1;
-    }
-    VkExportFenceCreateInfo export_info = {
-        .sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO,
-        .handleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT
-    };
-    VkFenceCreateInfo create_info = {
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = &export_info
-    };
-    if (p_vkCreateFence(device, &create_info, NULL, &fence) != VK_SUCCESS) {
-        VkResult result = p_vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
-        if (result != VK_SUCCESS) {
-            log_vk_result("vkQueueSubmit(stereo transport fallback)", result);
-            return -1;
-        }
-        if (!p_vkQueueWaitIdle || p_vkQueueWaitIdle(queue) != VK_SUCCESS)
-            return -1;
-        *submit_ok = 1;
-        return -1;
-    }
-    if (p_vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS) {
-        p_vkDestroyFence(device, fence, NULL);
-        return -1;
-    }
-    *submit_ok = 1;
-    VkFenceGetFdInfoKHR fd_info = {
-        .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
-        .fence = fence,
-        .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT
-    };
-    int fd = -1;
-    if (p_vkGetFenceFdKHR(device, &fd_info, &fd) != VK_SUCCESS) fd = -1;
-    p_vkDestroyFence(device, fence, NULL);
-    if (fd < 0) {
-        if (!p_vkQueueWaitIdle || p_vkQueueWaitIdle(queue) != VK_SUCCESS) {
-            *submit_ok = 0;
-            return -1;
-        }
-    }
-    return fd;
-}
 
 static int32_t unix_init(void *opaque)
 {
@@ -2045,7 +2155,7 @@ static int32_t unix_set_vulkan_context(void *opaque)
     }
     load_vulkan_functions();
 #if defined(__ANDROID__)
-    if (p_vkGetAndroidHardwareBufferPropertiesANDROID &&
+    if ((p_vkGetAndroidHardwareBufferPropertiesANDROID || allocate_shared) &&
         p_vkCreateCommandPool && !command_pool) {
         VkCommandPoolCreateInfo pool_info = {
             .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -2098,14 +2208,14 @@ static int32_t unix_create_swapchain(void *opaque)
 
 
     swapchain->image_count = 4;
-    int optimal = 0;
+    int prepare_ahb_copy = 0;
 #if defined(__ANDROID__)
-    optimal = swapchain->sample_count == 1 && ahb_transport_probe();
+    prepare_ahb_copy = swapchain->sample_count == 1 && ahb_transport_probe();
 #endif
     for (uint32_t i = 0; i < swapchain->image_count; ++i) {
         swapchain->images[i].dma_buf_fd = -1;
         if (!create_image(swapchain, &swapchain->images[i], args->array_size,
-                          args->mip_count, args->sample_count, optimal)) {
+                          args->mip_count, args->sample_count, prepare_ahb_copy)) {
             for (uint32_t j = 0; j <= i; ++j) destroy_image(&swapchain->images[j]);
             memset(swapchain, 0, sizeof(*swapchain));
             args->result = GN_UNIX_ERROR_VULKAN;
@@ -2140,6 +2250,95 @@ static int32_t unix_destroy_swapchain(void *opaque)
     return 0;
 }
 
+/* Diagnostic state has its own lock; no transport/submit lock is held when
+ * writing summaries. Durations are monotonic host time, not GPU timestamps. */
+static uint64_t submit_clock_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+struct gn_phase_stats {
+    uint64_t start, count, errors;
+    double sum[8], max[8];
+};
+static pthread_mutex_t timing_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct gn_phase_stats acquire_stats, pose_stats;
+
+static void record_phase_stats(struct gn_phase_stats *stats, const char *name,
+                               const char *const *labels, const double *samples,
+                               unsigned phases, int error)
+{
+    char line[1024];
+    int emit = 0;
+    const uint64_t now = submit_clock_ns();
+    pthread_mutex_lock(&timing_mutex);
+    if (!stats->start) stats->start = now;
+    ++stats->count;
+    stats->errors += error != 0;
+    for (unsigned i = 0; i < phases; ++i) {
+        stats->sum[i] += samples[i];
+        if (samples[i] > stats->max[i]) stats->max[i] = samples[i];
+    }
+    if (now - stats->start >= 5000000000ull) {
+        size_t off = snprintf(line, sizeof(line),
+            "VR %s: n=%llu windowMs=%.0f errors=%llu avg/max",
+            name, (unsigned long long)stats->count, (now-stats->start)/1e6,
+            (unsigned long long)stats->errors);
+        for (unsigned i = 0; i < phases && off < sizeof(line); ++i)
+            off += snprintf(line + off, sizeof(line) - off, " %s=%.2f/%.2f",
+                            labels[i], stats->sum[i]/stats->count, stats->max[i]);
+        memset(stats, 0, sizeof(*stats));
+        stats->start = now;
+        emit = 1;
+    }
+    pthread_mutex_unlock(&timing_mutex);
+    if (emit) {
+        log_line(line);
+#if defined(__ANDROID__)
+        __android_log_write(ANDROID_LOG_INFO, "gn_xr_submit", line);
+#endif
+    }
+}
+
+/* Match successful fast-path pose replies to the submitted target XrTime.
+ * XrTime is only a key: all measured intervals use the same host clock. */
+struct gn_pose_stamp { int64_t target; uint64_t first, last, query_ns; };
+static struct gn_pose_stamp pose_stamps[16];
+static unsigned pose_stamp_next;
+static void record_pose_reply(int64_t target, uint64_t start, uint64_t end)
+{
+    if (target <= 0) return;
+    pthread_mutex_lock(&timing_mutex);
+    struct gn_pose_stamp *stamp = NULL;
+    for (unsigned i = 0; i < 16; ++i)
+        if (pose_stamps[i].target == target) { stamp = &pose_stamps[i]; break; }
+    if (!stamp) {
+        stamp = &pose_stamps[pose_stamp_next++ % 16];
+        *stamp = (struct gn_pose_stamp){.target=target, .first=end};
+    }
+    stamp->last = end;
+    stamp->query_ns = end - start;
+    pthread_mutex_unlock(&timing_mutex);
+}
+
+static void record_pose_submission(int64_t target, uint64_t entered_ns)
+{
+    struct gn_pose_stamp stamp = {0};
+    pthread_mutex_lock(&timing_mutex);
+    for (unsigned i = 0; i < 16; ++i)
+        if (pose_stamps[i].target == target && target > 0) { stamp = pose_stamps[i]; break; }
+    pthread_mutex_unlock(&timing_mutex);
+    const int matched = stamp.first && stamp.last <= entered_ns;
+    const char *labels[] = {"matched", "firstPoseToSubmitMs", "lastPoseToSubmitMs", "lastPoseQueryMs"};
+    const double samples[] = {matched ? 1.0 : 0.0,
+        matched ? (entered_ns-stamp.first)/1e6 : 0,
+        matched ? (entered_ns-stamp.last)/1e6 : 0,
+        matched ? stamp.query_ns/1e6 : 0};
+    record_phase_stats(&pose_stats, "pose-to-submit", labels, samples, 4, !matched);
+}
+
 static int32_t unix_acquire_image(void *opaque)
 {
     struct gn_unix_acquire_image_args *args = opaque;
@@ -2148,17 +2347,26 @@ static int32_t unix_acquire_image(void *opaque)
         args->result = GN_UNIX_ERROR_ARGUMENT;
         return 0;
     }
+    const uint64_t entered_ns = submit_clock_ns();
+    uint64_t transaction_ns = 0, receive_ns = 0, release_ns = 0;
+    unsigned eyes = 0, fences = 0;
     pthread_mutex_lock(&submit_mutex);
     while (image_copy_busy[args->slot][args->image_index])
         pthread_cond_wait(&submit_space_cond, &submit_mutex);
     pthread_mutex_unlock(&submit_mutex);
+    const uint64_t copy_end_ns = submit_clock_ns();
 
     pthread_mutex_lock(&socket_mutex);
+    const uint64_t socket_ready_ns = submit_clock_ns();
     char line[512], response[64] = {0};
     snprintf(line, sizeof(line), "ACQUIRE eye=0 index=%u\n", args->image_index);
 
 
     struct gn_image *image = &swapchains[args->slot].images[args->image_index];
+    if (transport_ownership_failed) {
+        args->result = GN_UNIX_ERROR_TRANSPORT;
+        goto acquire_done;
+    }
     int timeout_ms;
     if (args->timeout_ns < 0 || args->timeout_ns > 2147483647000000LL)
         timeout_ms = -1;
@@ -2170,43 +2378,61 @@ static int32_t unix_acquire_image(void *opaque)
             args->slot * GN_UNIX_MAX_IMAGES + args->image_index;
         snprintf(line, sizeof(line), "ACQUIRE eye=%u index=%u timeout=%d\n",
                  eye, transport_index, timeout_ms);
-        if (!transact_line(line, response, sizeof(response))) {
-            args->result = GN_UNIX_ERROR_TRANSPORT;
-            pthread_mutex_unlock(&socket_mutex);
-            return 0;
-        }
-        if (!strcmp(response, "ERR timeout")) {
-            args->result = GN_UNIX_ERROR_TIMEOUT;
-            pthread_mutex_unlock(&socket_mutex);
-            return 0;
-        }
-        if (strncmp(response, "OK", 2)) {
-            args->result = GN_UNIX_ERROR_TRANSPORT;
-            pthread_mutex_unlock(&socket_mutex);
-            return 0;
-        }
-        if (strstr(response, "fence=1")) {
-            int fd = recv_fd(transport_fd);
-            if (fd < 0) {
-                close_transport();
-                args->result = GN_UNIX_ERROR_TRANSPORT;
-                pthread_mutex_unlock(&socket_mutex);
-                return 0;
+        ++eyes;
+        if (image->pending_release_fd[eye] < 0) {
+            const uint64_t transaction_start = submit_clock_ns();
+            const int transaction_ok = transact_line(line, response, sizeof(response));
+            transaction_ns += submit_clock_ns() - transaction_start;
+            if (!transaction_ok || strncmp(response, "OK", 2)) {
+                args->result = !strcmp(response, "ERR timeout") ? GN_UNIX_ERROR_TIMEOUT : GN_UNIX_ERROR_TRANSPORT;
+                goto acquire_done;
             }
-            struct pollfd pfd = {fd, POLLIN, 0};
+            if (strstr(response, "fence=1")) {
+                ++fences;
+                const uint64_t receive_start = submit_clock_ns();
+                image->pending_release_fd[eye] = recv_fd(transport_fd);
+                receive_ns += submit_clock_ns() - receive_start;
+                if (image->pending_release_fd[eye] < 0) {
+                    close_transport();
+                    args->result = GN_UNIX_ERROR_TRANSPORT;
+                    goto acquire_done;
+                }
+            }
+        }
+        if (image->pending_release_fd[eye] >= 0) {
+            struct pollfd pfd = {image->pending_release_fd[eye], POLLIN, 0};
             int waited;
+            const uint64_t release_start = submit_clock_ns();
             do waited = poll(&pfd, 1, timeout_ms); while (waited < 0 && errno == EINTR);
-            close(fd);
-            if (waited <= 0) {
+            release_ns += submit_clock_ns() - release_start;
+            if (waited <= 0 || !(pfd.revents & POLLIN) || (pfd.revents & (POLLERR | POLLNVAL))) {
+                /* Android has handed this fence to us. Retain it across a
+                 * timeout; a retry cannot retrieve the consumed fence again. */
                 args->result = waited == 0 ? GN_UNIX_ERROR_TIMEOUT : GN_UNIX_ERROR_TRANSPORT;
-                pthread_mutex_unlock(&socket_mutex);
-                return 0;
+                goto acquire_done;
             }
+            close(image->pending_release_fd[eye]);
+            image->pending_release_fd[eye] = -1;
+        }
+    }
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        if (image->transport[eye].external) {
+            image->transport[eye].external = 0;
+            atomic_fetch_sub(&outputs_handed_off, 1);
         }
     }
     image->submitted = 0;
     args->result = GN_UNIX_SUCCESS;
+acquire_done:
     pthread_mutex_unlock(&socket_mutex);
+    const uint64_t done_ns = submit_clock_ns();
+    const char *labels[] = {"copyOwnershipMs", "socketLockMs", "androidAcquireMs",
+                            "fenceReceiveMs", "releaseFenceMs", "totalMs", "eyes", "fences"};
+    const double samples[] = {(copy_end_ns-entered_ns)/1e6,
+        (socket_ready_ns-copy_end_ns)/1e6, transaction_ns/1e6,
+        receive_ns/1e6, release_ns/1e6, (done_ns-entered_ns)/1e6, eyes, fences};
+    record_phase_stats(&acquire_stats, "acquire", labels, samples, 8,
+                       args->result != GN_UNIX_SUCCESS);
     return 0;
 }
 
@@ -2269,13 +2495,22 @@ static int send_frame(const struct gn_unix_submit_view_args *view, int fence_fd,
 
 /* Asynchronous frame shipper: xrEndFrame used to drain the game's GPU queue synchronously
  * before transporting the frame, serializing the game's CPU and GPU completely. Instead,
- * xrEndFrame drops a fence on the game queue and returns; this worker waits for the render
- * to finish, runs the transport (relay copy + socket send), and the game overlaps its next
- * frame's CPU work with the GPU. */
+ * xrEndFrame queues same-device eye copies and exports a completion sync FD
+ * when supported, announcing the images before they finish. This worker retains
+ * their resources until the independent retirement fence signals. Without export
+ * support it also announces completion; only the fallback relay submits a late
+ * copy. The game overlaps its next frame's CPU work with the GPU. */
 struct gn_pending_submit {
     struct gn_unix_submit_view_args views[2];
     uint32_t view_count;
     VkFence fence;
+    VkSemaphore completion;
+    int early_transport; /* -1: deferred, 0: early send failed, 1: sent */
+    uint64_t early_transport_ns;
+    uint64_t frame_started_ns;
+    uint64_t entered_ns, enqueued_ns, marker_ns, slot_wait_ns;
+    uint32_t queued_at_enqueue;
+    int waited_for_slot;
     int used;
 };
 
@@ -2285,8 +2520,112 @@ static pthread_cond_t submit_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t submit_thread;
 static int submit_thread_running;
 static int submit_worker_busy;
+/* Game-frame admission uses GPU-completion markers, not socket queue depth.
+ * One prior submission may overlap a new frame; two pending submissions apply
+ * backpressure before the next input/pose sample. XR presentation never waits. */
+static unsigned pending_submission_count;
+static int submission_gpu_failed;
+static struct gn_production_estimate production_estimate;
+static struct { int64_t target; uint64_t started_ns; } game_starts[16];
+static unsigned game_start_next;
 
-static int submit_views_transport(const struct gn_unix_submit_view_args *views, uint32_t view_count);
+static uint64_t consume_game_start_locked(int64_t target)
+{
+    for (unsigned i = 0; i < 16; ++i) if (target > 0 && game_starts[i].target == target) {
+        const uint64_t start = game_starts[i].started_ns;
+        game_starts[i].target = 0;
+        return start;
+    }
+    return 0;
+}
+
+static int wait_game_budget(uint64_t timeout_ns, unsigned *in_flight, uint64_t *budget)
+{
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline); // submit_space_cond uses the default clock
+    deadline.tv_sec += timeout_ns / 1000000000ull;
+    deadline.tv_nsec += timeout_ns % 1000000000ull;
+    if (deadline.tv_nsec >= 1000000000L) { ++deadline.tv_sec; deadline.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&submit_mutex);
+    if (in_flight) *in_flight = pending_submission_count;
+    int result = 0;
+    while (pending_submission_count >= 2 && !submission_gpu_failed && !transport_ownership_failed && !result)
+        result = pthread_cond_timedwait(&submit_space_cond, &submit_mutex, &deadline);
+    int ok = !result && !submission_gpu_failed && !transport_ownership_failed;
+    if (budget) *budget = gn_production_budget(&production_estimate);
+    pthread_mutex_unlock(&submit_mutex);
+    return ok;
+}
+/* Never let an early notification overtake a deferred/fallback submission. */
+static atomic_uint unannounced_submits;
+
+static void retire_completion(VkSemaphore completion)
+{
+#if defined(__ANDROID__)
+    if (completion && destroy_completion) destroy_completion(device, completion);
+#else
+    (void)completion;
+#endif
+}
+
+/* Host wall-clock measurements, not GPU timestamp queries. Only the shipper
+ * worker owns the aggregation; producer measurements travel with each item. */
+
+static void record_submit_timing(const struct gn_pending_submit *item,
+                                 uint64_t picked_ns, uint64_t fence_ns,
+                                 uint64_t transport_ns, uint64_t idle_ns,
+                                 uint64_t done_ns, int fence_error,
+                                 int transport_error, int idle_error)
+{
+    static uint64_t start_ns, count, blocked, missing_fence, early, errors[3];
+    static double sums[7], maxima[7], queued_sum;
+    static uint32_t queued_max;
+    const double samples[7] = {
+        item->slot_wait_ns / 1e6, item->marker_ns / 1e6,
+        (picked_ns - item->enqueued_ns) / 1e6, fence_ns / 1e6,
+        transport_ns / 1e6, idle_ns / 1e6,
+        (done_ns - item->entered_ns) / 1e6
+    };
+    if (!start_ns) start_ns = item->entered_ns;
+    ++count;
+    early += item->early_transport >= 0;
+    blocked += item->waited_for_slot != 0;
+    missing_fence += item->fence == VK_NULL_HANDLE;
+    errors[0] += fence_error; errors[1] += transport_error; errors[2] += idle_error;
+    queued_sum += item->queued_at_enqueue;
+    if (item->queued_at_enqueue > queued_max) queued_max = item->queued_at_enqueue;
+    for (unsigned i = 0; i < 7; ++i) {
+        sums[i] += samples[i];
+        if (samples[i] > maxima[i]) maxima[i] = samples[i];
+    }
+    if (done_ns - start_ns < 5000000000ull) return;
+    char line[1024];
+    snprintf(line, sizeof(line),
+        "VR submission: n=%llu windowMs=%.0f queued(avg/max)=%.2f/%u blocked=%llu "
+        "missingFence=%llu early=%llu errors(fence/transport/idle)=%llu/%llu/%llu "
+        "ms(avg/max) slot=%.2f/%.2f marker=%.2f/%.2f residence=%.2f/%.2f "
+        "fence=%.2f/%.2f transport=%.2f/%.2f relayIdle=%.2f/%.2f total=%.2f/%.2f",
+        (unsigned long long)count, (done_ns - start_ns) / 1e6,
+        queued_sum / count, queued_max, (unsigned long long)blocked,
+        (unsigned long long)missing_fence, (unsigned long long)early, (unsigned long long)errors[0],
+        (unsigned long long)errors[1], (unsigned long long)errors[2],
+        sums[0]/count, maxima[0], sums[1]/count, maxima[1],
+        sums[2]/count, maxima[2], sums[3]/count, maxima[3],
+        sums[4]/count, maxima[4], sums[5]/count, maxima[5],
+        sums[6]/count, maxima[6]);
+    log_line(line);
+#if defined(__ANDROID__)
+    __android_log_write(ANDROID_LOG_INFO, "gn_xr_submit", line);
+#endif
+    start_ns = done_ns;
+    count = blocked = missing_fence = early = 0;
+    memset(errors, 0, sizeof(errors));
+    memset(sums, 0, sizeof(sums));
+    memset(maxima, 0, sizeof(maxima));
+    queued_sum = 0; queued_max = 0;
+}
+
+static int submit_views_transport(const struct gn_unix_submit_view_args *views, uint32_t view_count, int completion_fd);
 
 static void *submit_worker(void *unused)
 {
@@ -2300,6 +2639,7 @@ static void *submit_worker(void *unused)
             pthread_mutex_unlock(&submit_mutex);
             return NULL;
         }
+        const uint64_t picked_ns = submit_clock_ns();
         item = submit_ring[submit_ring_tail];
         submit_ring[submit_ring_tail].used = 0;
         submit_ring_tail = (submit_ring_tail + 1) % 4;
@@ -2307,11 +2647,19 @@ static void *submit_worker(void *unused)
         pthread_cond_signal(&submit_space_cond);
         pthread_mutex_unlock(&submit_mutex);
 
+        VkResult fence_result = VK_SUCCESS, idle_result = VK_SUCCESS;
+        const uint64_t fence_start_ns = submit_clock_ns();
         if (item.fence != VK_NULL_HANDLE) {
-            p_vkWaitForFences(device, 1, &item.fence, VK_TRUE, UINT64_MAX);
+            fence_result = p_vkWaitForFences(device, 1, &item.fence, VK_TRUE, UINT64_MAX);
             p_vkDestroyFence(device, item.fence, NULL);
         }
-        if (!submit_views_transport(item.views, item.view_count)) {
+        retire_completion(item.completion);
+        const uint64_t fence_end_ns = submit_clock_ns();
+        const int transport_ok = item.early_transport >= 0 ? item.early_transport :
+            (fence_result == VK_SUCCESS && submit_views_transport(item.views, item.view_count, -1));
+        if (item.early_transport < 0) atomic_fetch_sub(&unannounced_submits, 1);
+        const uint64_t transport_end_ns = submit_clock_ns();
+        if (!transport_ok) {
             static int failure_logged;
             if (!failure_logged) {
                 failure_logged = 1;
@@ -2320,7 +2668,12 @@ static void *submit_worker(void *unused)
         }
         /* The relay copy reads the source image on its own queue; the game must not
          * re-render into that image until the copy has actually executed. */
-        if (relay_state > 0 && r_vkQueueWaitIdle) r_vkQueueWaitIdle(relay_queue);
+        const uint64_t idle_start_ns = submit_clock_ns();
+        int used_relay = 0;
+        for (uint32_t i = 0; i < item.view_count; ++i)
+            used_relay |= swapchains[item.views[i].slot].images[item.views[i].image_index].transport_kind[item.views[i].eye] == GN_TRANSPORT_RELAY;
+        if (used_relay && relay_state > 0 && r_vkQueueWaitIdle) idle_result = r_vkQueueWaitIdle(relay_queue);
+        const uint64_t idle_end_ns = submit_clock_ns();
         pthread_mutex_lock(&submit_mutex);
         for (uint32_t i = 0; i < item.view_count; ++i) {
             if (item.views[i].slot < GN_UNIX_MAX_SWAPCHAINS &&
@@ -2328,9 +2681,17 @@ static void *submit_worker(void *unused)
                 image_copy_busy[item.views[i].slot][item.views[i].image_index])
                 --image_copy_busy[item.views[i].slot][item.views[i].image_index];
         }
+        if (pending_submission_count) --pending_submission_count;
+        if (fence_result != VK_SUCCESS) submission_gpu_failed = 1;
+        if (fence_result == VK_SUCCESS && item.frame_started_ns && fence_end_ns > item.frame_started_ns)
+            gn_production_observe(&production_estimate, fence_end_ns - item.frame_started_ns);
         submit_worker_busy = 0;
         pthread_cond_broadcast(&submit_space_cond);
         pthread_mutex_unlock(&submit_mutex);
+        record_submit_timing(&item, picked_ns, fence_end_ns - fence_start_ns,
+                             item.early_transport_ns + transport_end_ns - fence_end_ns, idle_end_ns - idle_start_ns,
+                             submit_clock_ns(), fence_result != VK_SUCCESS,
+                             !transport_ok, idle_result != VK_SUCCESS);
     }
 }
 
@@ -2345,34 +2706,135 @@ static void submit_worker_flush(void)
 
 static int submit_views_async(const struct gn_unix_submit_view_args *views, uint32_t view_count)
 {
+    if (!view_count || view_count > 2 || transport_ownership_failed) return 0;
+    for (uint32_t i = 0; i < view_count; ++i)
+        if (views[i].slot >= GN_UNIX_MAX_SWAPCHAINS || views[i].eye >= 2 ||
+            views[i].image_index >= swapchains[views[i].slot].image_count) return 0;
+    const uint64_t entered_ns = submit_clock_ns();
     if (!p_vkWaitForFences || !p_vkCreateFence || !p_vkDestroyFence || !p_vkQueueSubmit)
-        return submit_views_transport(views, view_count);
+        return 0; /* Never ship an image without a producer completion fence. */
 
+    const uint64_t marker_start_ns = submit_clock_ns();
+    VkFence fence = VK_NULL_HANDLE;
+    VkSemaphore completion = VK_NULL_HANDLE;
+    int early_transport = -1;
+    uint64_t early_transport_ns = 0;
+    VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (p_vkCreateFence(device, &fence_info, NULL, &fence) == VK_SUCCESS) {
+        VkCommandBuffer copy_commands[2];
+        struct gn_transport_image *copies[2];
+        uint32_t copy_count = 0;
+#if defined(__ANDROID__)
+        pthread_mutex_lock(&socket_mutex);
+        for (uint32_t i = 0; i < view_count; ++i) {
+            const struct gn_unix_submit_view_args *view = &views[i];
+            struct gn_image *image = &swapchains[view->slot].images[view->image_index];
+            if (!command_pool ||
+                (!allocate_shared && !p_vkGetAndroidHardwareBufferPropertiesANDROID)) continue;
+            if (!register_image(view->slot, view->image_index, view->eye, view->array_index)) {
+                pthread_mutex_unlock(&socket_mutex);
+                p_vkDestroyFence(device, fence, NULL);
+                return 0;
+            }
+            struct gn_transport_image *transport = &image->transport[view->eye];
+            if (image->transport_kind[view->eye] != GN_TRANSPORT_AHARDWAREBUFFER) continue;
+            if (transport->external) {
+                /* Re-presenting immutable content is safe; copying a different
+                 * layer over an Android-owned output is not. */
+                if (transport->recorded_array_index != view->array_index) {
+                    pthread_mutex_unlock(&socket_mutex);
+                    p_vkDestroyFence(device, fence, NULL);
+                    return 0;
+                }
+                continue;
+            }
+            if (!record_ahardwarebuffer_copy(&swapchains[view->slot], image, transport, view->array_index)) {
+                pthread_mutex_unlock(&socket_mutex);
+                p_vkDestroyFence(device, fence, NULL);
+                return 0;
+            }
+            copies[copy_count] = transport;
+            copy_commands[copy_count++] = transport->command_buffer;
+        }
+        pthread_mutex_unlock(&socket_mutex);
+#endif
+#if defined(__ANDROID__)
+        int same_device = !atomic_load(&unannounced_submits);
+        for (uint32_t i = 0; i < view_count; ++i)
+            same_device &= swapchains[views[i].slot].images[views[i].image_index].transport_kind[views[i].eye] == GN_TRANSPORT_AHARDWAREBUFFER;
+        if (same_device && create_completion) {
+            VkResult result = create_completion(device, &completion);
+            if (result != VK_SUCCESS) {
+                static int logged;
+                if (!logged) { logged = 1; log_vk_result("Early notification unavailable; retaining completion wait", result); }
+                completion = VK_NULL_HANDLE;
+            }
+        }
+#endif
+        VkSubmitInfo marker = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = copy_count, .pCommandBuffers = copy_commands,
+            .signalSemaphoreCount = completion ? 1u : 0u,
+            .pSignalSemaphores = completion ? &completion : NULL};
+        if (p_vkQueueSubmit(queue, 1, &marker, fence) != VK_SUCCESS) {
+            p_vkDestroyFence(device, fence, NULL);
+            retire_completion(completion);
+            completion = VK_NULL_HANDLE;
+            fence = VK_NULL_HANDLE;
+        } else {
+            for (uint32_t i = 0; i < copy_count; ++i) {
+                copies[i]->initialized = 1;
+                copies[i]->external = 1;
+                atomic_fetch_add(&outputs_handed_off, 1);
+            }
+        }
+    }
+
+    if (fence == VK_NULL_HANDLE) return 0;
+    const uint64_t marker_end_ns = submit_clock_ns();
+#if defined(__ANDROID__)
+    if (completion) {
+        int fd = -1;
+        VkResult result = export_completion(device, completion, &fd);
+        if (result == VK_SUCCESS) {
+            const uint64_t start = submit_clock_ns();
+            /* A successful SYNC_FD export returning -1 means already complete.
+             * Retirement still uses the independent, non-exported VkFence. */
+            early_transport = submit_views_transport(views, view_count, fd);
+            early_transport_ns = submit_clock_ns() - start;
+            if (fd >= 0) close(fd);
+            static int logged;
+            if (!logged && early_transport) {
+                logged = 1;
+                log_line("Early stereo notification active: exported SYNC_FD, independent retirement fence");
+            }
+        } else {
+            if (fd >= 0) close(fd);
+            static int logged;
+            if (!logged) { logged = 1; log_vk_result("Completion export failed; retaining completion wait", result); }
+        }
+    }
+#endif
     pthread_mutex_lock(&submit_mutex);
     if (!submit_thread_running) {
         submit_thread_running = 1;
         if (pthread_create(&submit_thread, NULL, submit_worker, NULL) != 0) {
             submit_thread_running = 0;
             pthread_mutex_unlock(&submit_mutex);
-            return submit_views_transport(views, view_count);
+            VkResult waited = p_vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+            p_vkDestroyFence(device, fence, NULL);
+            retire_completion(completion);
+            return waited == VK_SUCCESS && (early_transport >= 0 ? early_transport :
+                submit_views_transport(views, view_count, -1));
         }
         log_line("async frame shipper started");
     }
     pthread_mutex_unlock(&submit_mutex);
-
-    VkFence fence = VK_NULL_HANDLE;
-    VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    if (p_vkCreateFence(device, &fence_info, NULL, &fence) == VK_SUCCESS) {
-        VkSubmitInfo marker = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        if (p_vkQueueSubmit(queue, 1, &marker, fence) != VK_SUCCESS) {
-            p_vkDestroyFence(device, fence, NULL);
-            fence = VK_NULL_HANDLE;
-        }
-    }
-
     pthread_mutex_lock(&submit_mutex);
+    const uint64_t slot_start_ns = submit_clock_ns();
+    const int waited_for_slot = submit_ring[submit_ring_head].used != 0;
     while (submit_ring[submit_ring_head].used)
         pthread_cond_wait(&submit_space_cond, &submit_mutex);
+    const uint64_t slot_end_ns = submit_clock_ns();
     struct gn_pending_submit *slot = &submit_ring[submit_ring_head];
     for (uint32_t i = 0; i < view_count; ++i) {
         slot->views[i] = views[i];
@@ -2382,15 +2844,30 @@ static int submit_views_async(const struct gn_unix_submit_view_args *views, uint
     }
     slot->view_count = view_count;
     slot->fence = fence;
+    slot->frame_started_ns = consume_game_start_locked(views[0].target_display_time);
+    ++pending_submission_count;
+    slot->completion = completion;
+    slot->early_transport = early_transport;
+    slot->early_transport_ns = early_transport_ns;
+    if (early_transport < 0) atomic_fetch_add(&unannounced_submits, 1);
     slot->used = 1;
+    slot->entered_ns = entered_ns;
+    slot->marker_ns = marker_end_ns - marker_start_ns;
+    slot->slot_wait_ns = slot_end_ns - slot_start_ns;
+    slot->waited_for_slot = waited_for_slot;
+    slot->queued_at_enqueue = 0;
+    for (unsigned i = 0; i < 4; ++i) slot->queued_at_enqueue += submit_ring[i].used != 0;
+    slot->enqueued_ns = submit_clock_ns();
     submit_ring_head = (submit_ring_head + 1) % 4;
     pthread_cond_signal(&submit_cond);
     pthread_mutex_unlock(&submit_mutex);
+    if (view_count) record_pose_submission(views[0].target_display_time, entered_ns);
     return 1;
 }
 
+/* completion_fd is borrowed; the caller retains and closes its descriptor. */
 static int submit_views_transport(
-    const struct gn_unix_submit_view_args *views, uint32_t view_count)
+    const struct gn_unix_submit_view_args *views, uint32_t view_count, int completion_fd)
 {
     if (!view_count || view_count > 2) return 0;
     for (uint32_t i = 0; i < view_count; ++i) {
@@ -2422,9 +2899,6 @@ static int submit_views_transport(
     }
 
     pthread_mutex_lock(&socket_mutex);
-    VkCommandBuffer commands[2];
-    struct gn_transport_image *recorded[2];
-    uint32_t command_count = 0;
     VkCommandBuffer relay_commands[2];
     struct gn_transport_image *relay_recorded[2];
     uint32_t relay_count = 0;
@@ -2449,47 +2923,19 @@ static int submit_views_transport(
             relay_recorded[relay_count] = transport;
             ++relay_count;
         }
-        if (image->transport_kind[view->eye] == GN_TRANSPORT_AHARDWAREBUFFER) {
-            struct gn_transport_image *transport = &image->transport[view->eye];
-            if (!record_ahardwarebuffer_copy(
-                    &swapchains[view->slot], image, transport,
-                    view->array_index)) {
-                const uint8_t bit = (uint8_t)(1u << view->eye);
-                log_line("AHardwareBuffer GPU copy failed; switching image to dma-buf");
-                destroy_transport_image(transport);
-                image->transport_kind[view->eye] = GN_TRANSPORT_DMABUF;
-                image->registered_eye_mask &= (uint8_t)~bit;
-                if (!register_image(view->slot, view->image_index, view->eye,
-                                    view->array_index)) {
-                    pthread_mutex_unlock(&socket_mutex);
-                    return 0;
-                }
-            } else {
-                commands[command_count] = transport->command_buffer;
-                recorded[command_count] = transport;
-                ++command_count;
-            }
+        if (image->transport_kind[view->eye] == GN_TRANSPORT_AHARDWAREBUFFER &&
+            !image->transport[view->eye].external) {
+            /* All game-device copies must precede the producer marker. */
+            pthread_mutex_unlock(&socket_mutex);
+            return 0;
         }
 #endif
     }
 
-    int submit_ok = 0;
     int fence_fd = -1;
-    if (command_count == 0) {
-        submit_ok = 1;
-    } else {
-        fence_fd = submit_and_make_acquire_fence_fd(
-            commands, command_count, &submit_ok);
-    }
-    if (!submit_ok) {
-        if (fence_fd >= 0) close(fence_fd);
-        pthread_mutex_unlock(&socket_mutex);
-        return 0;
-    }
-    for (uint32_t i = 0; i < command_count; ++i) recorded[i]->initialized = 1;
 #if defined(__ANDROID__)
     if (relay_count) {
-        // The game-queue submit above already waited for the render to finish; the relay
+        // The worker waited for the producer marker; the relay
         // copy runs after it on its own device, and its fence becomes the acquire fence.
         int relay_ok = 0;
         int relay_fence = relay_submit(relay_commands, relay_count, &relay_ok);
@@ -2508,7 +2954,9 @@ static int submit_views_transport(
     int ok = 1;
     const uint64_t frame_id = ++transport_frame_id;
     for (uint32_t i = 0; i < view_count; ++i) {
-        const int view_fence_fd = i == 0 ? fence_fd : -1;
+        /* Each eye gets its own transferred FD reference, so a consumer cannot
+         * accidentally treat the second eye as ready on its own. */
+        const int view_fence_fd = completion_fd >= 0 ? completion_fd : (i == 0 ? fence_fd : -1);
         if (!send_frame(&views[i], view_fence_fd, frame_id)) {
             ok = 0;
             break;
@@ -2606,8 +3054,23 @@ static int control_fast_connect(void)
 
 static int32_t unix_control_transact(void *opaque)
 {
+    const uint64_t query_start_ns = submit_clock_ns();
     struct gn_unix_control_transact_args *args = opaque;
     args->request[sizeof(args->request) - 1] = 0;
+    const int frame_sync = !strcmp(args->request, "FRAME_SYNC") || !strcmp(args->request, "WAIT_FRAME");
+    const int submit_budget = !strcmp(args->request, "SUBMIT_BUDGET");
+    uint64_t production_budget = 0, admission_wait_ns = 0;
+    unsigned in_flight = 0;
+    if (frame_sync || submit_budget) {
+        const uint64_t before = submit_clock_ns();
+        const int admitted = wait_game_budget(5000000000ull, &in_flight, &production_budget);
+        admission_wait_ns = submit_clock_ns() - before;
+        if (!admitted || submit_budget) {
+            snprintf(args->response, sizeof(args->response), "%s", admitted ? "OK" : "ERROR gpu_busy");
+            args->result = GN_UNIX_SUCCESS; // keep the error visible; do not bypass via Winsock
+            return 0;
+        }
+    }
     uint32_t lines = args->response_lines ? args->response_lines : 1;
     if (lines > 8) lines = 8;
     args->result = GN_UNIX_ERROR_TRANSPORT;
@@ -2616,10 +3079,11 @@ static int32_t unix_control_transact(void *opaque)
         pthread_mutex_unlock(&control_fast_mutex);
         return 0;
     }
-    size_t request_length = strlen(args->request);
-    args->request[request_length] = '\n';
-    int sent = write_all(control_fast_fd, args->request, request_length + 1);
-    args->request[request_length] = 0;
+    char request[256];
+    if (frame_sync) snprintf(request, sizeof(request), "%s budget=%llu\n", args->request,
+                             (unsigned long long)production_budget);
+    else snprintf(request, sizeof(request), "%s\n", args->request);
+    int sent = write_all(control_fast_fd, request, strlen(request));
     if (!sent) {
         control_fast_close();
         pthread_mutex_unlock(&control_fast_mutex);
@@ -2646,8 +3110,31 @@ static int32_t unix_control_transact(void *opaque)
         if (i == 0 && strncmp(line, "OK", 2) != 0) break;
     }
     args->response[offset] = 0;
+    if (!truncated && !strncmp(args->request, "LOCATE_VIEWS time=", sizeof("LOCATE_VIEWS time=") - 1) &&
+        !strncmp(args->response, "OK", 2))
+        record_pose_reply(strtoll(args->request + sizeof("LOCATE_VIEWS time=") - 1, NULL, 10),
+                          query_start_ns, submit_clock_ns());
+    if (frame_sync && !truncated && !strncmp(args->response, "OK", 2)) {
+        const char *time = strstr(args->response, " time=");
+        const int64_t target = time ? strtoll(time + 6, NULL, 10) : 0;
+        pthread_mutex_lock(&submit_mutex);
+        if (target > 0) {
+            game_starts[game_start_next].target = target;
+            game_starts[game_start_next].started_ns = submit_clock_ns();
+            game_start_next = (game_start_next + 1) % 16;
+        }
+        pthread_mutex_unlock(&submit_mutex);
+    }
     args->result = GN_UNIX_SUCCESS;
     pthread_mutex_unlock(&control_fast_mutex);
+    if (frame_sync) {
+        static struct gn_phase_stats pacing_stats;
+        static const char *const labels[] = {"gpuAdmissionMs", "controlMs", "productionBudgetMs", "pending"};
+        const double values[] = {admission_wait_ns / 1e6,
+            (submit_clock_ns() - query_start_ns - admission_wait_ns) / 1e6,
+            production_budget / 1e6, in_flight};
+        record_phase_stats(&pacing_stats, "pacing", labels, values, 4, truncated);
+    }
     return 0;
 }
 

@@ -1,0 +1,6 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "ffx_adapter.glsl"
+#include "upstream/ffx_opticalflow_filter_optical_flow_v5.h"
+layout(local_size_x=16,local_size_y=4) in;
+void main() { FilterOpticalFlow(ivec2(gl_GlobalInvocationID.xy),ivec2(gl_LocalInvocationID.xy),ivec2(gl_WorkGroupID.xy),int(gl_LocalInvocationIndex)); }

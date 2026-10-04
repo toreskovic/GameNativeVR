@@ -22,17 +22,19 @@ constexpr uint32_t DESCRIPTOR_SETS_PER_SLOT = 112;
 }
 
 LsfgChain::LsfgChain(const Device& device, const LsfgShaders& shaders, VkExtent2D extent,
-                     VkFormat format, float flow_scale)
+                     VkFormat format, float flow_scale, LsfgImagePair* external_frames)
     : resources{device, flow_scale}, owner{device.Handle()} {
     descriptor_pool = CreateLsfgDescriptorPool(
         device, FIXED_DESCRIPTOR_SETS +
                     DESCRIPTOR_SETS_PER_SLOT * static_cast<uint32_t>(LSFG_GENERATION_SLOTS));
     if (descriptor_pool == VK_NULL_HANDLE) return;
 
-    for (auto& image : frames) {
-        image = LsfgImage(device, extent, format);
-        if (!image.Valid()) return;
+    if (external_frames) {
+        frames = std::move(*external_frames);
+    } else {
+        for (auto& image : frames) image = LsfgImage(device, extent, format);
     }
+    for (auto& image : frames) if (!image.Valid()) return;
 
     mipmaps = LsfgMipmaps(device, shaders, resources, descriptor_pool, frames, flow_scale);
     if (!mipmaps.Valid()) return;

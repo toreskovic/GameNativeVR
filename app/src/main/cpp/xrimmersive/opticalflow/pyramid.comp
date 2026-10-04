@@ -1,0 +1,43 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "alignment.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform sampler2D colorInput;
+#ifdef COMPACT_LUMA
+#define LUMA_FORMAT r8ui
+#else
+#define LUMA_FORMAT r32ui
+#endif
+layout(binding=2,LUMA_FORMAT) writeonly uniform uimage2D level0;
+layout(binding=5,LUMA_FORMAT) writeonly uniform uimage2D level1;
+layout(binding=6,LUMA_FORMAT) writeonly uniform uimage2D level2;
+shared uint tile[256];
+uint brightness(ivec2 pos,ivec2 extent) {
+    vec2 uv=(vec2(min(pos,extent-1))+0.5)/vec2(extent), d=0.25/vec2(extent);
+    vec3 c=textureLod(colorInput,rawUv(uv+vec2(-d.x,-d.y),p.size.z!=0),0).rgb+
+           textureLod(colorInput,rawUv(uv+vec2(d.x,-d.y),p.size.z!=0),0).rgb+
+           textureLod(colorInput,rawUv(uv+vec2(-d.x,d.y),p.size.z!=0),0).rgb+
+           textureLod(colorInput,rawUv(uv+d,p.size.z!=0),0).rgb;
+    return uint(clamp(round(dot(c*0.25,vec3(.2126,.7152,.0722))*255.0),0.0,255.0));
+}
+void main() {
+    ivec2 local=ivec2(gl_LocalInvocationID.xy), group=ivec2(gl_WorkGroupID.xy);
+    for(int y=0;y<2;++y) for(int x=0;x<2;++x) {
+        ivec2 q=local*2+ivec2(x,y), pos=group*16+q;
+        uint v=brightness(pos,imageSize(level0)); tile[q.y*16+q.x]=v;
+        if(all(lessThan(pos,imageSize(level0)))) imageStore(level0,pos,uvec4(v));
+    }
+    barrier();
+    int at=local.y*32+local.x*2;
+    uint v=uint(round(float(tile[at]+tile[at+1]+tile[at+16]+tile[at+17])*.25));
+    ivec2 pos=group*8+local;
+    if(all(lessThan(pos,imageSize(level1)))) imageStore(level1,pos,uvec4(v));
+    // All level-0 readers must finish before reusing shared storage.
+    barrier(); tile[local.y*8+local.x]=v; barrier();
+    if(local.x<4 && local.y<4) {
+        at=local.y*16+local.x*2;
+        v=uint(round(float(tile[at]+tile[at+1]+tile[at+8]+tile[at+9])*.25));
+        pos=group*4+local;
+        if(all(lessThan(pos,imageSize(level2)))) imageStore(level2,pos,uvec4(v));
+    }
+}

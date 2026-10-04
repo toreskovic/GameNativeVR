@@ -52,6 +52,20 @@ public final class LosslessScaling {
             fp16 = false;
         }
 
+        return resolveOrBuildCacheVariant(context, dll, fp16);
+    }
+
+    public static File resolveOrBuildCacheFp32(Context context, File dll) {
+        if (context == null || dll == null || !dll.isFile()) return null;
+        return resolveOrBuildCacheVariant(context, dll, false);
+    }
+
+    public static File resolveOrBuildCacheFp16(Context context, File dll) {
+        if (context == null || dll == null || !dll.isFile()) return null;
+        return resolveOrBuildCacheVariant(context, dll, true);
+    }
+
+    private static synchronized File resolveOrBuildCacheVariant(Context context, File dll, boolean fp16) {
         File store = new File(context.getFilesDir(), STORE_DIR);
         if (!store.isDirectory() && !store.mkdirs()) return null;
         File cache = new File(store, fp16 ? CACHE_FP16 : CACHE_FP32);

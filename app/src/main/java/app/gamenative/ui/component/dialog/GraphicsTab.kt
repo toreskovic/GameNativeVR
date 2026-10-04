@@ -228,6 +228,24 @@ fun GraphicsTabContent(state: ContainerConfigState, default: Boolean = false) {
                             state.config.value = config.copy(xrForceDisableMsaa = checked)
                         },
                     )
+                    SettingsSwitch(
+                        colors = settingsTileColorsAlt(),
+                        title = { Text(stringResource(R.string.xr_packed_transport)) },
+                        subtitle = { Text(stringResource(R.string.xr_packed_transport_desc)) },
+                        state = config.xrPackedTransport,
+                        onCheckedChange = { checked ->
+                            state.config.value = config.copy(xrPackedTransport = checked)
+                        },
+                    )
+                    SettingsSwitch(
+                        colors = settingsTileColorsAlt(),
+                        title = { Text(stringResource(R.string.xr_fxaa)) },
+                        subtitle = { Text(stringResource(R.string.xr_fxaa_desc)) },
+                        state = config.xrFxaa,
+                        onCheckedChange = { checked ->
+                            state.config.value = config.copy(xrFxaa = checked)
+                        },
+                    )
                     SettingsListDropdown(
                         colors = settingsTileColors(),
                         title = { Text(stringResource(R.string.xr_ffr_title)) },
@@ -236,6 +254,16 @@ fun GraphicsTabContent(state: ContainerConfigState, default: Boolean = false) {
                             stringResource(R.string.xr_ffr_conservative), stringResource(R.string.xr_ffr_aggressive)),
                         onItemSelected = { mode -> state.config.value = config.copy(xrFoveation = mode) },
                     )
+                    SettingsListDropdown(
+                        colors = settingsTileColors(),
+                        title = { Text(stringResource(R.string.xr_ffr_debug)) },
+                        value = config.xrFfrDebug.coerceIn(0, 3),
+                        items = listOf(stringResource(R.string.xr_ffr_off),
+                            stringResource(R.string.xr_ffr_debug_game), stringResource(R.string.xr_ffr_debug_post), stringResource(R.string.xr_visibility_debug)),
+                        onItemSelected = { mode -> state.config.value = config.copy(xrFfrDebug = mode) },
+                    )
+                    Text(stringResource(R.string.xr_ffr_debug_desc),
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
                     Text(stringResource(R.string.xr_ffr_desc),
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
                     SettingsListDropdown(
@@ -631,7 +659,7 @@ private fun DxWrapperSection(state: ContainerConfigState) {
 private fun LsfgSection(state: ContainerConfigState) {
     val config = state.config.value
     val lsfgSupported = config.containerVariant.equals(Container.BIONIC, ignoreCase = true)
-    if (!lsfgSupported) return
+    if (!lsfgSupported || config.windowsVrEnabled) return
 
     var dllAvailable by rememberSaveable { mutableStateOf(LsfgVkManager.isDllAvailable()) }
     val ownsApp = LsfgVkManager.ownsLosslessScaling()
