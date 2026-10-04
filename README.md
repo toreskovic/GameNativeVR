@@ -15,13 +15,19 @@
 - Game compatibility fixes (Clone Drone in the Hyperdome anyone?)
 - A toggle to disable MSAA in DX11 games (some games don't expose a setting and MSAA is expensive)
 - FOV scale so you can literally cut corners for performance gain
-- sensible default config that should work out of the box for most games (at least the ones I tried)
+- Lightweight antialiasing
+- VR performance overlay (press both analog sticks to toggle it)
+- More responsive controller tracking (vanilla GameNative caches controller poses per frame which can cause latency)
+- Various optimizations in how the game gets its output to the OpenXR side (and ultimately the screen)
+- Sensible default config that should work out of the box for most games (at least the ones I tried)
 
 All new features are configurable under the graphics tab in the container settings
 
 ## Anecdotal Performance / Compatibility Notes
 
-**All testing was done on a Pico 4 using the Pico metrics overlay. It unfortunately reports the android present FPS instead of the actual game FPS. Resolutions are approximate since this fork is applying a bit of an aspect ratio so in practice it's not a square**
+### Obsolete initial testing
+
+**NOTE: these tests were done on a Pico 4 using the Pico metrics overlay. It shows the OpenXR present FPS instead of the actual game FPS (actual game FPS was about half the reported OpenXR FPS and headset reprojection tricked me into thinking it's smoother than it really was). Resolutions are approximate since this fork is applying a bit of an aspect ratio so in practice it's not a square**
 
 **Beat Saber (all graphics settings low or off)**: vanilla GameNative needed 60% resolution scaling (1296x1296 per eye) to get stable 72 FPS. With fixed foveated rendering, it goes to 85% (1836x1836) with SGSR or 90% (1944x1944) without SGSR while still at a stable 72 FPS. Lowering the FOV gets it to 100% resolution at 72 FPS.
 
